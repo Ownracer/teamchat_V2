@@ -277,55 +277,9 @@ async def join_chat(request: dict):
             
     return {"message": "Joined chat", "chat": chat_doc_data}
 
-@app.get("/chats/{chat_id}/messages")
-async def get_messages(chat_id: int):
-    chat_doc_data = get_chat_doc(chat_id)
-    if not chat_doc_data:
-        return []
-    
-    chats_ref = db.collection("chats")
-    query = chats_ref.where("id", "==", chat_id).limit(1).stream()
-    for doc in query:
-        messages_ref = doc.reference.collection("messages")
-        msgs = [m.to_dict() for m in messages_ref.order_by("id").stream()]
-        return msgs
-    return []
 
-@app.post("/chats/{chat_id}/messages")
-async def add_message(chat_id: int, message: Message, background_tasks: BackgroundTasks):
-    # 1. Save to SQLite (Local First)
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Generate ID using timestamp
-    new_id = int(datetime.now().timestamp() * 1000)
-    
-    msg_dict = message.dict()
-    msg_dict["id"] = new_id
-    msg_dict["isPinned"] = False
-    
-    cursor.execute('''
-        INSERT INTO messages (id, chat_id, text, sender, time, type, fileUrl, fileName, fileSize, isPinned, synced)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-    ''', (
-        new_id,
-        chat_id,
-        msg_dict.get("text"),
-        msg_dict.get("sender"),
-        msg_dict.get("time"),
-        msg_dict.get("type"),
-        msg_dict.get("fileUrl"),
-        msg_dict.get("fileName"),
-        msg_dict.get("fileSize"),
-        0 # isPinned
-    ))
-    conn.commit()
-    conn.close()
-    
-    # 2. Trigger Background Sync
-    background_tasks.add_task(sync_to_firebase)
-    
-    return msg_dict
+
+
 
 # --- Helper Functions ---
 
@@ -605,8 +559,17 @@ async def get_messages(chat_id: int):
         msg["isPinned"] = bool(msg["isPinned"])
         # Ensure ID is int
         msg["id"] = int(msg["id"])
+        
+        # Map DB columns to Pydantic model fields
+        if "fileName" in msg:
+            msg["filename"] = msg.pop("fileName")
+        if "fileSize" in msg:
+            msg["size"] = msg.pop("fileSize")
+            
         msgs.append(msg)
         
+    with open("debug.log", "a") as f:
+        f.write(f"DEBUG: get_messages returning {len(msgs)} messages. Sample: {msgs[-1] if msgs else 'None'}\n")
     return msgs
 
 @app.post("/chats/{chat_id}/messages")
@@ -619,6 +582,9 @@ async def add_message(chat_id: int, message: Message, background_tasks: Backgrou
     new_id = int(datetime.now().timestamp() * 1000)
     
     msg_dict = message.dict()
+    with open("debug.log", "a") as f:
+        f.write(f"DEBUG: add_message received: {msg_dict}\n")
+    
     msg_dict["id"] = new_id
     msg_dict["isPinned"] = False
     
@@ -633,8 +599,8 @@ async def add_message(chat_id: int, message: Message, background_tasks: Backgrou
         msg_dict.get("time"),
         msg_dict.get("type"),
         msg_dict.get("fileUrl"),
-        msg_dict.get("fileName"),
-        msg_dict.get("fileSize"),
+        msg_dict.get("filename"), # Fix: Use 'filename' from Pydantic model
+        msg_dict.get("size"), # Fix: Use 'size' from Pydantic model (DB has fileSize, model has size)
         0 # isPinned
     ))
     conn.commit()
@@ -821,7 +787,7 @@ async def upload_file(file: UploadFile = File(...)):
     with open(file_location, "wb+") as file_object:
         shutil.copyfileobj(file.file, file_object)
     
-    return {"url": f"http://localhost:8000/uploads/{file.filename}"}
+    return {"url": f"/uploads/{file.filename}"}
 
 @app.post("/analyze-message")
 async def analyze_message_endpoint(analysis_request: IdeaAnalysis):

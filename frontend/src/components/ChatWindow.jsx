@@ -1,11 +1,17 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { ArrowLeft, Phone, Video, MoreVertical, Paperclip, Mic, Send, Lightbulb, Trash2, Reply, X, Forward, Users, Pin, ChevronLeft, ChevronRight, PhoneOff } from 'lucide-react';
+import { ArrowLeft, Phone, Video, MoreVertical, Paperclip, Mic, Send, Lightbulb, Trash2, Reply, X, Forward, Users, Pin, ChevronLeft, ChevronRight, PhoneOff, Image } from 'lucide-react';
 import VideoCall from './VideoCall';
 import FilePreviewModal from './FilePreviewModal';
 import ConfirmationModal from './ConfirmationModal';
 
 const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteChat }) => {
-    const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+    // Dynamic API URL for local network access
+    const getApiUrl = () => {
+        if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
+        // Fallback: Use current hostname (e.g., 192.168.x.x) with backend port 8000
+        return `http://${window.location.hostname}:8000`;
+    };
+    const API_URL = getApiUrl();
     const [message, setMessage] = useState('');
     const [messages, setMessages] = useState([]);
     const [callRoomName, setCallRoomName] = useState(null); // State for active call room
@@ -593,41 +599,61 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
 
                             {/* Message Content */}
                             {msg.type === 'file' ? (
-                                <div className="flex items-center space-x-3">
-                                    <div className="bg-red-100 p-2 rounded-lg">
-                                        <Paperclip className="text-red-500" size={24} />
-                                    </div>
-                                    <div
-                                        className="cursor-pointer hover:bg-gray-50 p-1 rounded transition-colors"
-                                        onClick={async (e) => {
-                                            e.stopPropagation(); // Prevent triggering other clicks
-                                            if (msg.fileUrl) {
-                                                try {
-                                                    const response = await fetch(msg.fileUrl);
-                                                    if (!response.ok) throw new Error('Download failed');
+                                <div
+                                    className="flex items-center space-x-3 cursor-pointer hover:bg-black/5 p-2 rounded-lg transition-colors relative group/file"
+                                    onClick={async (e) => {
+                                        e.stopPropagation();
+                                        if (!msg.fileUrl) {
+                                            alert("File URL missing");
+                                            return;
+                                        }
 
-                                                    const blob = await response.blob();
-                                                    const url = window.URL.createObjectURL(blob);
-                                                    const link = document.createElement('a');
-                                                    link.href = url;
-                                                    link.download = msg.filename; // This forces download to default folder
-                                                    document.body.appendChild(link);
-                                                    link.click();
-                                                    document.body.removeChild(link);
-                                                    window.URL.revokeObjectURL(url);
-                                                } catch (error) {
-                                                    console.error("Download error:", error);
-                                                    alert("Failed to download file. Please try again.");
-                                                }
-                                            } else {
-                                                alert(`File URL not found for ${msg.filename}`);
+                                        // URL Construction Logic
+                                        let fileUrl = msg.fileUrl;
+                                        console.log("Original URL:", fileUrl);
+                                        console.log("API_URL:", API_URL);
+
+                                        if (fileUrl.includes('localhost:8000')) {
+                                            fileUrl = fileUrl.replace(/http:\/\/localhost:8000/g, API_URL).replace(/http:\/\/127.0.0.1:8000/g, API_URL);
+                                        } else if (!fileUrl.startsWith('http')) {
+                                            fileUrl = `${API_URL}${fileUrl}`;
+                                        }
+                                        console.log("Final URL:", fileUrl);
+
+                                        // Check file type
+                                        const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(msg.filename);
+
+                                        if (isImage) {
+                                            window.open(fileUrl, '_blank');
+                                        } else {
+                                            // Download
+                                            try {
+                                                const response = await fetch(fileUrl);
+                                                if (!response.ok) throw new Error('Download failed');
+                                                const blob = await response.blob();
+                                                const url = window.URL.createObjectURL(blob);
+                                                const link = document.createElement('a');
+                                                link.href = url;
+                                                link.download = msg.filename || 'download';
+                                                document.body.appendChild(link);
+                                                link.click();
+                                                document.body.removeChild(link);
+                                                window.URL.revokeObjectURL(url);
+                                            } catch (error) {
+                                                console.error("Download error:", error);
+                                                alert("Failed to download file.");
                                             }
-                                        }}
-                                    >
-                                        <p className="font-medium text-gray-800">{msg.filename}</p>
-                                        <p className="text-xs text-gray-500">{msg.size}</p>
+                                        }
+                                    }}
+                                >
+                                    <div className={`p-2 rounded-lg ${/\.(jpg|jpeg|png|gif|webp)$/i.test(msg.filename) ? 'bg-purple-100 text-purple-500' : 'bg-red-100 text-red-500'}`}>
+                                        {/\.(jpg|jpeg|png|gif|webp)$/i.test(msg.filename) ? <Image size={24} /> : <Paperclip size={24} />}
                                     </div>
-                                    <button className="opacity-0 group-hover/msg:opacity-100 absolute -left-10 top-2 bg-yellow-100 text-yellow-700 p-1.5 rounded-full shadow-sm hover:bg-yellow-200 transition-opacity" title="Mark as Idea" onClick={() => handleAnalyzeFile(msg.filename)}>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="font-medium text-gray-800 truncate text-sm">{msg.filename || "Unknown File"}</p>
+                                        <p className="text-xs text-gray-500">{msg.size || "Unknown size"}</p>
+                                    </div>
+                                    <button className="opacity-0 group-hover/file:opacity-100 absolute -left-10 top-2 bg-yellow-100 text-yellow-700 p-1.5 rounded-full shadow-sm hover:bg-yellow-200 transition-opacity" title="Mark as Idea" onClick={(e) => { e.stopPropagation(); handleAnalyzeFile(msg.filename); }}>
                                         <Lightbulb size={16} />
                                     </button>
                                 </div>
