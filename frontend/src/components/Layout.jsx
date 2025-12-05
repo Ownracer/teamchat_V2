@@ -32,7 +32,9 @@ const Layout = () => {
   // WebSocket Connection
   useEffect(() => {
     if (user) {
-      const ws = new WebSocket(`ws://localhost:8000/ws/${user.id}`);
+      const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      const wsUrl = apiUrl.replace('http', 'ws');
+      const ws = new WebSocket(`${wsUrl}/ws/${user.id}`);
 
       ws.onopen = () => {
         console.log("Connected to WebSocket");
@@ -60,18 +62,23 @@ const Layout = () => {
 
   // Fetch chats on mount
   useEffect(() => {
-    fetch('http://localhost:8000/chats')
+    const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+    fetch(`${apiUrl}/chats`)
       .then(res => res.json())
-      .then(data => setChats(data))
+      .then(data => {
+        console.log("Fetched chats:", data);
+        setChats(data);
+      })
       .catch(err => console.error("Failed to fetch chats", err));
-  }, []);
+  }, [user]);
 
   // Public Groups State
   const [publicGroups, setPublicGroups] = useState([]);
 
   // Fetch public groups
   useEffect(() => {
-    fetch('http://localhost:8000/chats/public')
+    const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+    fetch(`${apiUrl}/chats/public`)
       .then(res => res.json())
       .then(data => setPublicGroups(data))
       .catch(err => console.error("Failed to fetch public groups", err));
@@ -101,7 +108,7 @@ const Layout = () => {
       message: 'Are you sure you want to delete this chat? This action cannot be undone.',
       isDanger: true,
       onConfirm: () => {
-        fetch(`http://localhost:8000/chats/${chatId}`, { method: 'DELETE' })
+        fetch(`${import.meta.env.VITE_API_URL}/chats/${chatId}`, { method: 'DELETE' })
           .then(() => {
             setChats(chats.filter(c => c.id !== chatId));
             setSelectedChat(null);
@@ -119,7 +126,7 @@ const Layout = () => {
       createdBy: user ? { name: user.name, email: user.email } : null
     };
 
-    fetch('http://localhost:8000/chats', {
+    fetch('${import.meta.env.VITE_API_URL}/chats', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(groupWithCreator)
@@ -139,7 +146,7 @@ const Layout = () => {
     if (!user) return;
 
     // Use the add_participant endpoint to add self
-    fetch(`http://localhost:8000/chats/${group.id}/participants`, {
+    fetch(`${import.meta.env.VITE_API_URL}/chats/${group.id}/participants`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: user.email })
@@ -150,7 +157,7 @@ const Layout = () => {
       })
       .then(() => {
         // Refresh chats to show the new group
-        return fetch('http://localhost:8000/chats');
+        return fetch('${import.meta.env.VITE_API_URL}/chats');
       })
       .then(res => res.json())
       .then(data => {
@@ -176,7 +183,7 @@ const Layout = () => {
   const handleUpdateProfile = (newName) => {
     if (!newName.trim()) return;
 
-    fetch(`http://localhost:8000/users/${user.id}`, {
+    fetch(`${import.meta.env.VITE_API_URL}/users/${user.id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: newName })

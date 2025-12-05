@@ -7,7 +7,8 @@ const CalendarView = () => {
     const [events, setEvents] = useState([]);
 
     useEffect(() => {
-        fetch('http://localhost:8000/ideas')
+        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+        fetch(`${apiUrl}/ideas`)
             .then(res => res.json())
             .then(data => {
                 // Filter ideas with deadlines and map to events

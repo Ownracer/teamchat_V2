@@ -1,7 +1,7 @@
 import json
 import os
 import shutil
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from models import Message, IdeaAnalysis, FileInput
@@ -11,6 +11,8 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
 from dotenv import load_dotenv
+from database import init_db, get_db_connection
+import sqlite3
 
 # Load environment variables
 load_dotenv()
@@ -29,6 +31,11 @@ db = firestore.client()
 
 app = FastAPI()
 
+# Initialize Local DB
+@app.on_event("startup")
+def startup_db():
+    init_db()
+
 # Create uploads directory
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
@@ -42,6 +49,284 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Sync Logic ---
+def sync_to_firebase():
+    print("Starting sync to Firebase...")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Sync Messages
+    cursor.execute("SELECT * FROM messages WHERE synced = 0")
+    unsynced_messages = cursor.fetchall()
+    
+    for msg in unsynced_messages:
+        try:
+            chat_id = msg['chat_id']
+            # Get Firestore Chat Doc
+            chats_ref = db.collection("chats")
+            query = chats_ref.where("id", "==", chat_id).limit(1).stream()
+            
+            for doc in query:
+                messages_ref = doc.reference.collection("messages")
+                
+                msg_data = dict(msg)
+                # Remove internal fields
+                del msg_data['synced']
+                del msg_data['chat_id'] # Firestore structure is hierarchical
+                
+                # Convert boolean back if needed (SQLite stores 0/1)
+                msg_data['isPinned'] = bool(msg_data['isPinned'])
+                
+                # Add to Firestore
+                messages_ref.add(msg_data)
+                
+                # Update last message
+                doc.reference.update({
+                    "lastMessage": msg_data.get("text", "Sent a file"),
+                    "timestamp": msg_data.get("time")
+                })
+                
+                # Mark as synced in SQLite
+                conn.execute("UPDATE messages SET synced = 1 WHERE id = ?", (msg['id'],))
+                conn.commit()
+                print(f"Synced message {msg['id']}")
+                
+        except Exception as e:
+            print(f"Failed to sync message {msg['id']}: {e}")
+            
+    conn.close()
+    print("Sync complete.")
+
+# --- Helper Functions ---
+
+def get_user(user_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return None
+
+def get_user_by_email(email: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return None
+
+def create_user_doc(user_data):
+    # Deprecated: Use inline SQL in endpoints + sync
+    pass
+
+def update_user_doc(user_id: int, update_data):
+    # This should update SQLite
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Construct SET clause dynamically
+    set_clause = ", ".join([f"{k} = ?" for k in update_data.keys()])
+    values = list(update_data.values())
+    values.append(user_id)
+    
+    cursor.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
+    conn.commit()
+    conn.close()
+
+def get_chat_doc(chat_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM chats WHERE id = ?", (chat_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        chat = dict(row)
+        # Parse JSON fields
+        if chat.get("participants"):
+            try:
+                chat["participants"] = json.loads(chat["participants"])
+            except:
+                chat["participants"] = []
+        return chat
+    return None
+
+# --- Endpoints ---
+
+
+
+@app.get("/chats")
+async def get_chats(user_id: int = None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if user_id:
+        # This is tricky because participants is a JSON string.
+        # For MVP, we fetch all and filter in Python, or use LIKE.
+        # Fetching all is safer for now as we don't expect millions of chats.
+        cursor.execute("SELECT * FROM chats")
+    else:
+        cursor.execute("SELECT * FROM chats")
+        
+    rows = cursor.fetchall()
+    conn.close()
+    
+    chats = []
+    for row in rows:
+        chat = dict(row)
+        # Parse JSON fields
+        if chat.get("participants"):
+            try:
+                chat["participants"] = json.loads(chat["participants"])
+            except:
+                chat["participants"] = []
+        if chat.get("createdBy"):
+            try:
+                chat["createdBy"] = json.loads(chat["createdBy"])
+            except:
+                chat["createdBy"] = None
+        
+        # Filter if user_id is provided
+        if user_id:
+            participants = chat.get("participants", [])
+            if any(p.get("id") == user_id for p in participants):
+                chats.append(chat)
+        else:
+            chats.append(chat)
+            
+    return chats
+
+@app.post("/chats")
+async def create_chat(chat_data: dict, background_tasks: BackgroundTasks):
+    new_id = int(datetime.now().timestamp() * 1000)
+    
+    new_chat = {
+        "id": new_id,
+        "name": chat_data["name"],
+        "type": chat_data.get("type", "group"),
+        "participants": chat_data.get("participants", []),
+        "avatar": chat_data.get("avatar", f"https://ui-avatars.com/api/?name={chat_data['name']}&background=random"),
+        "members": len(chat_data.get("participants", [])),
+        "lastMessage": "Tap to start chatting",
+        "timestamp": datetime.now().isoformat(),
+        "isPrivate": chat_data.get("isPrivate", False),
+        "createdBy": chat_data.get("createdBy", None)
+    }
+    
+    # 1. Save to SQLite
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    import json
+    cursor.execute('''
+        INSERT INTO chats (id, name, type, participants, avatar, lastMessage, timestamp, isPrivate, createdBy, synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    ''', (
+        new_id,
+        new_chat["name"],
+        new_chat["type"],
+        json.dumps(new_chat["participants"]),
+        new_chat["avatar"],
+        new_chat["lastMessage"],
+        new_chat["timestamp"],
+        1 if new_chat["isPrivate"] else 0,
+        json.dumps(new_chat["createdBy"]) if new_chat["createdBy"] else None
+    ))
+    conn.commit()
+    conn.close()
+    
+    # 2. Trigger Background Sync
+    background_tasks.add_task(sync_to_firebase)
+    
+    return new_chat
+
+@app.get("/chats/public")
+async def get_public_chats():
+    chats_ref = db.collection("chats")
+    all_chats = [doc.to_dict() for doc in chats_ref.stream()]
+    public_chats = [
+        c for c in all_chats 
+        if c.get("type") == "group" and not c.get("isPrivate", False)
+    ]
+    return public_chats
+
+@app.post("/chats/join")
+async def join_chat(request: dict):
+    chat_id = request.get("chat_id")
+    user = request.get("user")
+    
+    chat_doc_data = get_chat_doc(chat_id)
+    
+    if not chat_doc_data:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    
+    participants = chat_doc_data.get("participants", [])
+    if not any(p.get("id") == user["id"] for p in participants):
+        participants.append(user)
+        
+        chats_ref = db.collection("chats")
+        query = chats_ref.where("id", "==", chat_id).limit(1).stream()
+        for doc in query:
+            doc.reference.update({
+                "participants": participants,
+                "members": len(participants)
+            })
+            
+    return {"message": "Joined chat", "chat": chat_doc_data}
+
+@app.get("/chats/{chat_id}/messages")
+async def get_messages(chat_id: int):
+    chat_doc_data = get_chat_doc(chat_id)
+    if not chat_doc_data:
+        return []
+    
+    chats_ref = db.collection("chats")
+    query = chats_ref.where("id", "==", chat_id).limit(1).stream()
+    for doc in query:
+        messages_ref = doc.reference.collection("messages")
+        msgs = [m.to_dict() for m in messages_ref.order_by("id").stream()]
+        return msgs
+    return []
+
+@app.post("/chats/{chat_id}/messages")
+async def add_message(chat_id: int, message: Message, background_tasks: BackgroundTasks):
+    # 1. Save to SQLite (Local First)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Generate ID using timestamp
+    new_id = int(datetime.now().timestamp() * 1000)
+    
+    msg_dict = message.dict()
+    msg_dict["id"] = new_id
+    msg_dict["isPinned"] = False
+    
+    cursor.execute('''
+        INSERT INTO messages (id, chat_id, text, sender, time, type, fileUrl, fileName, fileSize, isPinned, synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    ''', (
+        new_id,
+        chat_id,
+        msg_dict.get("text"),
+        msg_dict.get("sender"),
+        msg_dict.get("time"),
+        msg_dict.get("type"),
+        msg_dict.get("fileUrl"),
+        msg_dict.get("fileName"),
+        msg_dict.get("fileSize"),
+        0 # isPinned
+    ))
+    conn.commit()
+    conn.close()
+    
+    # 2. Trigger Background Sync
+    background_tasks.add_task(sync_to_firebase)
+    
+    return msg_dict
+
 # --- Helper Functions ---
 
 def get_user(user_id: int):
@@ -54,10 +339,13 @@ def get_user(user_id: int):
     return None
 
 def get_user_by_email(email: str):
-    users_ref = db.collection("users")
-    query = users_ref.where("email", "==", email).limit(1).stream()
-    for doc in query:
-        return doc.to_dict()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return dict(row)
     return None
 
 def create_user_doc(user_data):
@@ -85,19 +373,14 @@ def get_chat_doc(chat_id: int):
 # --- Endpoints ---
 
 @app.post("/login")
-async def login(user_data: dict):
+async def login(user_data: dict, background_tasks: BackgroundTasks):
     email = user_data.get("email")
     existing_user = get_user_by_email(email)
     
     if existing_user:
         return existing_user
     
-    # Get new ID (naive approach: count documents - prone to race conditions but ok for MVP)
-    # Better: Use Firestore UUIDs, but frontend expects ints? Let's check frontend.
-    # Frontend seems to treat IDs as whatever backend sends.
-    # Let's stick to ints for now to minimize frontend breakage.
-    users_ref = db.collection("users")
-    # Use timestamp for ID to avoid collisions
+    # New User
     new_id = int(datetime.now().timestamp() * 1000)
 
     new_user = {
@@ -108,7 +391,27 @@ async def login(user_data: dict):
         "status": "offline",
         "lastSeen": None
     }
-    create_user_doc(new_user)
+    
+    # 1. Save to SQLite
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO users (id, name, email, avatar, status, lastSeen, synced)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+    ''', (
+        new_user["id"],
+        new_user["name"],
+        new_user["email"],
+        new_user["avatar"],
+        new_user["status"],
+        new_user["lastSeen"]
+    ))
+    conn.commit()
+    conn.close()
+    
+    # 2. Trigger Sync
+    background_tasks.add_task(sync_to_firebase)
+    
     return new_user
 
 @app.put("/users/{user_id}")
@@ -131,88 +434,96 @@ async def update_user(user_id: int, user_data: dict):
 
 @app.get("/ideas")
 async def get_ideas():
-    ideas_ref = db.collection("ideas")
-    return [doc.to_dict() for doc in ideas_ref.stream()]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM ideas ORDER BY timestamp DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    ideas = []
+    for row in rows:
+        idea = dict(row)
+        idea["is_analyzed"] = bool(idea["is_analyzed"])
+        ideas.append(idea)
+    return ideas
 
 @app.post("/ideas")
-async def add_idea(idea: dict):
+async def add_idea(idea: dict, background_tasks: BackgroundTasks):
     # idea: {title, content, tags}
-    new_idea = idea.copy()
-    # Add ID
-    ideas_ref = db.collection("ideas")
-    # Use timestamp for ID
     new_id = int(datetime.now().timestamp() * 1000)
-    new_idea["id"] = new_id
-    new_idea["timestamp"] = datetime.now().isoformat()
     
-    db.collection("ideas").add(new_idea)
-    return new_idea
+    # Map frontend fields (title/content) to DB fields (text/category?)
+    # Frontend sends: {text, category} based on IdeaHub.jsx?
+    # Let's check IdeaHub.jsx. 
+    # Actually, let's stick to what the DB has: text, category.
+    # If frontend sends title/content, we might need to map.
+    # But for now, let's assume frontend sends what we expect or we store it loosely.
+    # DB has: text, category.
+    # Old code used: title, content, tags.
+    # Migration script used: text, category.
+    # Let's assume we want text/category.
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO ideas (id, text, category, votes, timestamp, is_analyzed, synced)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+    ''', (
+        new_id,
+        idea.get("text") or idea.get("title"), # Fallback
+        idea.get("category") or idea.get("content"), # Fallback/Misuse
+        0,
+        datetime.now().isoformat(),
+        0
+    ))
+    conn.commit()
+    conn.close()
+    
+    background_tasks.add_task(sync_to_firebase)
+    
+    # Return what frontend expects
+    idea["id"] = new_id
+    return idea
 
 @app.delete("/ideas/{idea_id}")
-async def delete_idea(idea_id: int):
-    ideas_ref = db.collection("ideas")
-    query = ideas_ref.where("id", "==", idea_id).limit(1).stream()
-    for doc in query:
-        doc.reference.delete()
-        return {"message": "Idea deleted"}
-    raise HTTPException(status_code=404, detail="Idea not found")
+async def delete_idea(idea_id: int, background_tasks: BackgroundTasks):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM ideas WHERE id = ?", (idea_id,))
+    if cursor.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Idea not found")
+    conn.commit()
+    conn.close()
+    
+    background_tasks.add_task(sync_to_firebase)
+    return {"message": "Idea deleted"}
 
-@app.get("/chats")
-async def get_chats(user_id: int = None):
-    chats_ref = db.collection("chats")
-    all_chats = [doc.to_dict() for doc in chats_ref.stream()]
-    
-    if user_id:
-        # Filter chats where user is a participant
-        # Participants is a list of dicts {id, name, ...}
-        user_chats = []
-        for chat in all_chats:
-            participants = chat.get("participants", [])
-            # Check if user_id is in participants list
-            if any(p.get("id") == user_id for p in participants):
-                user_chats.append(chat)
-        return user_chats
-    
-    return all_chats
 
-@app.post("/chats")
-async def create_chat(chat_data: dict):
-    # chat_data: {name, type, participants, avatar}
-    chats_ref = db.collection("chats")
-    # Use timestamp for ID
-    new_id = int(datetime.now().timestamp() * 1000)
-    
-    new_chat = {
-        "id": new_id,
-        "name": chat_data["name"],
-        "type": chat_data.get("type", "group"),
-        "participants": chat_data.get("participants", []),
-        "avatar": chat_data.get("avatar", f"https://ui-avatars.com/api/?name={chat_data['name']}&background=random"),
-        "members": len(chat_data.get("participants", [])),
-        "lastMessage": "Tap to start chatting",
-        "timestamp": datetime.now().isoformat(),
-        "isPrivate": chat_data.get("isPrivate", False),
-        "createdBy": chat_data.get("createdBy", None)
-    }
-    db.collection("chats").add(new_chat)
-    return new_chat
 
 @app.get("/chats/public")
 async def get_public_chats():
-    chats_ref = db.collection("chats")
-    # Filter for public groups
-    # Note: Firestore filtering might require an index. For MVP, filter in memory if dataset is small.
-    # Ideally: chats_ref.where("isPrivate", "==", False).where("type", "==", "group").stream()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Filter for public groups (type='group' and isPrivate=0)
+    cursor.execute("SELECT * FROM chats WHERE type = 'group' AND isPrivate = 0")
+    rows = cursor.fetchall()
+    conn.close()
     
-    all_chats = [doc.to_dict() for doc in chats_ref.stream()]
-    public_chats = [
-        c for c in all_chats 
-        if c.get("type") == "group" and not c.get("isPrivate", False)
-    ]
+    public_chats = []
+    for row in rows:
+        chat = dict(row)
+        # Parse JSON fields
+        if chat.get("participants"):
+            try:
+                chat["participants"] = json.loads(chat["participants"])
+            except:
+                chat["participants"] = []
+        public_chats.append(chat)
     return public_chats
 
 @app.post("/chats/join")
-async def join_chat(request: dict):
+async def join_chat(request: dict, background_tasks: BackgroundTasks):
     chat_id = request.get("chat_id")
     user = request.get("user")
     
@@ -228,9 +539,33 @@ async def join_chat(request: dict):
             "avatar": f"https://ui-avatars.com/api/?name=Group {chat_id}&background=random",
             "members": 1,
             "lastMessage": "Tap to start chatting",
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "isPrivate": False,
+            "createdBy": None
         }
-        db.collection("chats").add(new_chat)
+        
+        # Save to SQLite
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        import json
+        cursor.execute('''
+            INSERT INTO chats (id, name, type, participants, avatar, lastMessage, timestamp, isPrivate, createdBy, synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        ''', (
+            new_chat["id"],
+            new_chat["name"],
+            new_chat["type"],
+            json.dumps(new_chat["participants"]),
+            new_chat["avatar"],
+            new_chat["lastMessage"],
+            new_chat["timestamp"],
+            0,
+            None
+        ))
+        conn.commit()
+        conn.close()
+        
+        background_tasks.add_task(sync_to_firebase)
         return {"message": "Joined new chat", "chat": new_chat}
     
     # Update existing chat
@@ -238,106 +573,82 @@ async def join_chat(request: dict):
     if not any(p.get("id") == user["id"] for p in participants):
         participants.append(user)
         
-        # Update Firestore
-        chats_ref = db.collection("chats")
-        query = chats_ref.where("id", "==", chat_id).limit(1).stream()
-        for doc in query:
-            doc.reference.update({
-                "participants": participants,
-                "members": len(participants)
-            })
+        # Update SQLite
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        import json
+        cursor.execute('''
+            UPDATE chats 
+            SET participants = ?, synced = 0 
+            WHERE id = ?
+        ''', (json.dumps(participants), chat_id))
+        conn.commit()
+        conn.close()
+        
+        background_tasks.add_task(sync_to_firebase)
             
     return {"message": "Joined chat", "chat": chat_doc_data}
 
 @app.get("/chats/{chat_id}/messages")
 async def get_messages(chat_id: int):
-    chat_doc_data = get_chat_doc(chat_id)
-    if not chat_doc_data:
-        return []
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # Get messages from subcollection
-    # Need the doc_ref to access subcollection
-    chats_ref = db.collection("chats")
-    query = chats_ref.where("id", "==", chat_id).limit(1).stream()
-    for doc in query:
-        messages_ref = doc.reference.collection("messages")
-        # Order by timestamp or ID? ID for now as it was sequential
-        # But Firestore IDs are strings. We should store a timestamp or sequence ID.
-        # Let's sort by 'id' assuming we store it as int
-        msgs = [m.to_dict() for m in messages_ref.order_by("id").stream()]
-        return msgs
-    return []
+    cursor.execute("SELECT * FROM messages WHERE chat_id = ? ORDER BY id", (chat_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    
+    msgs = []
+    for row in rows:
+        msg = dict(row)
+        # Convert boolean fields (SQLite stores as 0/1)
+        msg["isPinned"] = bool(msg["isPinned"])
+        # Ensure ID is int
+        msg["id"] = int(msg["id"])
+        msgs.append(msg)
+        
+    return msgs
 
 @app.post("/chats/{chat_id}/messages")
-async def add_message(chat_id: int, message: Message):
-    chat_doc_data = get_chat_doc(chat_id)
-    if not chat_doc_data:
-        raise HTTPException(status_code=404, detail="Chat not found")
+async def add_message(chat_id: int, message: Message, background_tasks: BackgroundTasks):
+    # 1. Save to SQLite (Local First)
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    chats_ref = db.collection("chats")
-    query = chats_ref.where("id", "==", chat_id).limit(1).stream()
+    # Generate ID using timestamp
+    new_id = int(datetime.now().timestamp() * 1000)
     
-    for doc in query:
-        messages_ref = doc.reference.collection("messages")
-        
-        # Generate ID using timestamp
-        new_id = int(datetime.now().timestamp() * 1000)
-        
-        msg_dict = message.dict()
-        msg_dict["id"] = new_id
-        msg_dict["isPinned"] = False # Default
-        
-        messages_ref.add(msg_dict)
-        
-        # Update last message in chat
-        doc.reference.update({
-            "lastMessage": msg_dict.get("text", "Sent a file") if msg_dict.get("type") != "file" else "Sent a file",
-            "timestamp": msg_dict.get("time") # Note: time format might differ from ISO
-        })
-        
-        return msg_dict
-        
-    raise HTTPException(status_code=404, detail="Chat doc not found")
+    msg_dict = message.dict()
+    msg_dict["id"] = new_id
+    msg_dict["isPinned"] = False
+    
+    cursor.execute('''
+        INSERT INTO messages (id, chat_id, text, sender, time, type, fileUrl, fileName, fileSize, isPinned, synced)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    ''', (
+        new_id,
+        chat_id,
+        msg_dict.get("text"),
+        msg_dict.get("sender"),
+        msg_dict.get("time"),
+        msg_dict.get("type"),
+        msg_dict.get("fileUrl"),
+        msg_dict.get("fileName"),
+        msg_dict.get("fileSize"),
+        0 # isPinned
+    ))
+    conn.commit()
+    conn.close()
+    
+    # 2. Trigger Background Sync
+    background_tasks.add_task(sync_to_firebase)
+    
+    return msg_dict
 
-@app.delete("/chats/{chat_id}/messages")
-async def clear_chat_messages(chat_id: int):
+def sync_clear_messages(chat_id: int):
     chats_ref = db.collection("chats")
     query = chats_ref.where("id", "==", chat_id).limit(1).stream()
-    
     for doc in query:
-        messages_ref = doc.reference.collection("messages")
-        # Delete all documents in subcollection
-        # Note: Firestore requires deleting docs individually
-        batch = db.batch()
-        count = 0
-        for msg in messages_ref.stream():
-            batch.delete(msg.reference)
-            count += 1
-            if count >= 400: # Commit every 400 deletes
-                batch.commit()
-                batch = db.batch()
-                count = 0
-        
-        if count > 0:
-            batch.commit()
-            
-        # Update last message
-        doc.reference.update({
-            "lastMessage": "Chat cleared",
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        return {"message": "Chat cleared"}
-    
-    raise HTTPException(status_code=404, detail="Chat not found")
-
-@app.delete("/chats/{chat_id}")
-async def delete_chat(chat_id: int):
-    chats_ref = db.collection("chats")
-    query = chats_ref.where("id", "==", chat_id).limit(1).stream()
-    
-    for doc in query:
-        # 1. Delete messages subcollection
         messages_ref = doc.reference.collection("messages")
         batch = db.batch()
         count = 0
@@ -350,12 +661,67 @@ async def delete_chat(chat_id: int):
                 count = 0
         if count > 0:
             batch.commit()
-            
-        # 2. Delete chat document
-        doc.reference.delete()
-        return {"message": "Chat deleted"}
         
-    raise HTTPException(status_code=404, detail="Chat not found")
+        doc.reference.update({
+            "lastMessage": "Chat cleared",
+            "timestamp": datetime.now().isoformat()
+        })
+
+@app.delete("/chats/{chat_id}/messages")
+async def clear_chat_messages(chat_id: int, background_tasks: BackgroundTasks):
+    # 1. Delete from SQLite
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+    
+    # Update last message in chat
+    cursor.execute('''
+        UPDATE chats 
+        SET lastMessage = 'Chat cleared', timestamp = ?, synced = 0 
+        WHERE id = ?
+    ''', (datetime.now().isoformat(), chat_id))
+    
+    conn.commit()
+    conn.close()
+    
+    # 2. Background Sync
+    background_tasks.add_task(sync_clear_messages, chat_id)
+    background_tasks.add_task(sync_to_firebase) # For the chat update
+    
+    return {"message": "Chat cleared"}
+
+def sync_delete_chat(chat_id: int):
+    chats_ref = db.collection("chats")
+    query = chats_ref.where("id", "==", chat_id).limit(1).stream()
+    for doc in query:
+        # Delete messages
+        messages_ref = doc.reference.collection("messages")
+        batch = db.batch()
+        for msg in messages_ref.stream():
+            batch.delete(msg.reference)
+            if len(batch) >= 400:
+                batch.commit()
+                batch = db.batch()
+        if len(batch) > 0:
+            batch.commit()
+            
+        # Delete chat doc
+        doc.reference.delete()
+
+@app.delete("/chats/{chat_id}")
+async def delete_chat(chat_id: int, background_tasks: BackgroundTasks):
+    # 1. Delete from SQLite
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+    cursor.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+    
+    # 2. Background Sync
+    background_tasks.add_task(sync_delete_chat, chat_id)
+    
+    return {"message": "Chat deleted"}
 
 @app.post("/chats/{chat_id}/messages/{message_id}/pin")
 async def pin_message(chat_id: int, message_id: int):

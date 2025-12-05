@@ -5,6 +5,7 @@ import FilePreviewModal from './FilePreviewModal';
 import ConfirmationModal from './ConfirmationModal';
 
 const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteChat }) => {
+    const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
     const [message, setMessage] = useState('');
     const [messages, setMessages] = useState([]);
     const [callRoomName, setCallRoomName] = useState(null); // State for active call room
@@ -59,7 +60,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
 
         try {
             // 1. Upload File
-            const response = await fetch('http://localhost:8000/upload', {
+            const response = await fetch(`${API_URL}/upload`, {
                 method: 'POST',
                 body: formData
             });
@@ -77,7 +78,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             };
 
             // 2. Save Message to Backend
-            const msgResponse = await fetch(`http://localhost:8000/chats/${chat.id}/messages`, {
+            const msgResponse = await fetch(`${API_URL}/chats/${chat.id}/messages`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(newMessage)
@@ -109,7 +110,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
         lastMessagesRef.current = ""; // Reset on chat change
 
         const fetchMessages = () => {
-            fetch(`http://localhost:8000/chats/${chat.id}/messages`)
+            fetch(`${API_URL}/chats/${chat.id}/messages`)
                 .then(res => res.json())
                 .then(data => {
                     const dataStr = JSON.stringify(data);
@@ -136,7 +137,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
     useEffect(() => {
         // Fetch participants if it's a group to get accurate count
         if (chat.type === 'group') {
-            fetch(`http://localhost:8000/chats/${chat.id}/participants`)
+            fetch(`${API_URL}/chats/${chat.id}/participants`)
                 .then(res => res.json())
                 .then(data => {
                     // Ensure current user is included in the list
@@ -165,7 +166,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             replyTo: replyingTo
         };
 
-        fetch(`http://localhost:8000/chats/${chat.id}/messages`, {
+        fetch(`${API_URL}/chats/${chat.id}/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(newMessage)
@@ -192,7 +193,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             status: 'sent'
         };
 
-        fetch(`http://localhost:8000/chats/${chat.id}/messages`, {
+        fetch(`${API_URL}/chats/${chat.id}/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(callMessage)
@@ -220,7 +221,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             isVoice: true
         };
 
-        fetch(`http://localhost:8000/chats/${chat.id}/messages`, {
+        fetch(`${API_URL}/chats/${chat.id}/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(callMessage)
@@ -246,7 +247,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             isDanger: true,
             confirmText: 'End Call',
             onConfirm: () => {
-                fetch(`http://localhost:8000/chats/${chat.id}/messages/${msgId}`, {
+                fetch(`${API_URL}/chats/${chat.id}/messages/${msgId}`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -279,7 +280,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             isForwarded: true
         };
 
-        fetch(`http://localhost:8000/chats/${targetChatId}/messages`, {
+        fetch(`${API_URL}/chats/${targetChatId}/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(forwardedMsg)
@@ -294,7 +295,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
 
     const handleDeleteMessage = (id, forEveryone) => {
         if (forEveryone) {
-            fetch(`http://localhost:8000/chats/${chat.id}/messages/${id}`, {
+            fetch(`${API_URL}/chats/${chat.id}/messages/${id}`, {
                 method: 'DELETE'
             })
                 .then(() => {
@@ -309,7 +310,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
     };
 
     const handlePinMessage = (messageId) => {
-        fetch(`http://localhost:8000/chats/${chat.id}/messages/${messageId}/pin`, {
+        fetch(`${API_URL}/chats/${chat.id}/messages/${messageId}/pin`, {
             method: 'POST'
         })
             .then(res => res.json())
@@ -346,7 +347,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             isDanger: true,
             confirmText: 'Clear',
             onConfirm: () => {
-                fetch(`http://localhost:8000/chats/${chat.id}/messages`, {
+                fetch(`${API_URL}/chats/${chat.id}/messages`, {
                     method: 'DELETE'
                 })
                     .then(() => {
@@ -378,7 +379,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
     const handleAnalyzeFile = async (filename) => {
         showNotification(`Analyzing ${filename}...`);
         try {
-            const response = await fetch('http://localhost:8000/analyze-file', {
+            const response = await fetch(`${API_URL}/analyze-file`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -402,7 +403,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
     const handleAnalyzeMessage = async (text, sender) => {
         showNotification("Analyzing message...");
         try {
-            const response = await fetch('http://localhost:8000/analyze-message', {
+            const response = await fetch(`${API_URL}/analyze-message`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -429,7 +430,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
 
     const submitAddMember = () => {
         if (addMemberEmail) {
-            fetch(`http://localhost:8000/chats/${chat.id}/participants`, {
+            fetch(`${API_URL}/chats/${chat.id}/participants`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ email: addMemberEmail })

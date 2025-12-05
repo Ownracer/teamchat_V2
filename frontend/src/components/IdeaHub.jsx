@@ -5,7 +5,8 @@ const IdeaHub = () => {
     const [ideas, setIdeas] = useState([]);
 
     useEffect(() => {
-        fetch('http://localhost:8000/ideas')
+        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+        fetch(`${apiUrl}/ideas`)
             .then(res => res.json())
             .then(data => {
                 setIdeas(data);
@@ -15,7 +16,7 @@ const IdeaHub = () => {
 
     const handleDeleteIdea = (id) => {
         if (window.confirm("Are you sure you want to delete this idea?")) {
-            fetch(`http://localhost:8000/ideas/${id}`, { method: 'DELETE' })
+            fetch(`${import.meta.env.VITE_API_URL}/ideas/${id}`, { method: 'DELETE' })
                 .then(() => {
                     setIdeas(ideas.filter(idea => idea.id !== id));
                 })
