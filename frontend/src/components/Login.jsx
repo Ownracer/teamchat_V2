@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 
-const Login = ({ onLogin, onSwitchToRegister }) => {
+const Login = ({ onLogin, onSwitchToRegister, showNotification }) => {
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
 
@@ -28,10 +28,10 @@ const Login = ({ onLogin, onSwitchToRegister }) => {
                 onLogin(userData);
             } catch (error) {
                 console.error("Login failed", error);
-                alert(`Login failed: ${error.message}`);
+                showNotification(`Login failed: ${error.message}`);
             }
         } else {
-            alert('Please enter email');
+            showNotification('Please enter email');
         }
     };
 

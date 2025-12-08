@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Search, MoreVertical, MessageSquare, Lightbulb, Calendar, User, Plus, Users, Link as LinkIcon, Lock, Globe, LogOut, Star, CheckSquare, UserPlus, X, Trash2 } from 'lucide-react';
 
-const Sidebar = ({ chats, publicGroups, onSelectChat, onCreateGroup, onJoinGroup, activeTab, onTabChange, onLogout, currentUser, onBulkDelete }) => {
+const Sidebar = ({ chats, publicGroups, onSelectChat, onCreateGroup, onJoinGroup, activeTab, onTabChange, onLogout, currentUser, onBulkDelete, showNotification }) => {
     const [searchQuery, setSearchQuery] = useState('');
     const [showCreateGroup, setShowCreateGroup] = useState(false);
     const [newGroupName, setNewGroupName] = useState('');
@@ -55,7 +55,7 @@ const Sidebar = ({ chats, publicGroups, onSelectChat, onCreateGroup, onJoinGroup
     };
 
     const handleStarredMessagesClick = () => {
-        alert("Starred messages feature coming soon!");
+        showNotification("Starred messages feature coming soon!");
         setShowMenu(false);
     };
 

@@ -58,6 +58,9 @@ def init_db():
             callRoomName TEXT,
             callStatus TEXT,
             isVoice BOOLEAN DEFAULT 0,
+            replyTo TEXT,
+            isDeleted BOOLEAN DEFAULT 0,
+            deleted_for TEXT DEFAULT '[]',
             synced BOOLEAN DEFAULT 0,
             FOREIGN KEY (chat_id) REFERENCES chats (id)
         )

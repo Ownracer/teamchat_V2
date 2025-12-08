@@ -43,6 +43,11 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
     // Toast State
     const [toast, setToast] = useState(null);
     const [fileToPreview, setFileToPreview] = useState(null);
+    const [deleteOptions, setDeleteOptions] = useState(null);
+
+    // Derived state for delete permissions
+    const msgToDelete = deleteOptions ? messages.find(m => m.id === deleteOptions) : null;
+    const canDeleteForEveryone = msgToDelete && (String(msgToDelete.sender) === String(currentUser?.id) || msgToDelete.sender === 'me');
 
     const handleFileSelect = (e) => {
         const file = e.target.files[0];
@@ -114,7 +119,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             console.error("File upload failed", error);
             // Mark as failed
             setMessages(prev => prev.map(msg => msg.id === tempId ? { ...msg, status: 'failed' } : msg));
-            alert("Failed to upload file");
+            showNotification("Failed to upload file");
         }
     };
 
@@ -124,6 +129,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
     };
 
     const messagesEndRef = useRef(null);
+    const prevMessagesLen = useRef(0);
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -135,8 +141,13 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
         lastMessagesRef.current = ""; // Reset on chat change
 
         const fetchMessages = () => {
-            fetch(`${API_URL}/chats/${chat.id}/messages`)
-                .then(res => res.json())
+            if (!currentUser) return; // Don't fetch if user not ready
+
+            fetch(`${API_URL}/chats/${chat.id}/messages?user_id=${currentUser.id}`)
+                .then(res => {
+                    if (!res.ok) throw new Error("Failed to fetch messages");
+                    return res.json();
+                })
                 .then(data => {
                     const dataStr = JSON.stringify(data);
                     if (dataStr !== lastMessagesRef.current) {
@@ -157,8 +168,6 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
 
         // WebSocket Connection
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = API_URL.replace('http', 'ws').replace('https', 'wss'); // Simple replacement
-        // Better URL construction:
         const wsBase = API_URL.replace(/^http/, 'ws');
         const socket = new WebSocket(`${wsBase}/ws/${chat.id}/${currentUser?.id || 0}`);
 
@@ -168,6 +177,15 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
 
         socket.onmessage = (event) => {
             const msg = JSON.parse(event.data);
+
+            // Handle Participant Updates
+            if (msg.type === 'participant_update') {
+                console.log("Received participant update", msg.participants);
+                setParticipants(msg.participants);
+                return;
+            }
+
+            // Handle Normal Messages
             setMessages(prev => {
                 // Avoid duplicates
                 if (prev.some(m => m.id === msg.id)) return prev;
@@ -213,7 +231,14 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
         return `User ${senderId}`;
     };
 
-    useEffect(scrollToBottom, [messages]);
+    useEffect(() => {
+        // Only scroll if we were already at the bottom OR if message is from me
+        // For simplicity, sticking to length check but could be improved
+        if (messages.length > prevMessagesLen.current) {
+            scrollToBottom();
+        }
+        prevMessagesLen.current = messages.length;
+    }, [messages]);
 
     const handleSendMessage = () => {
         if (!message.trim()) return;
@@ -353,19 +378,36 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             .catch(err => console.error("Failed to forward message", err));
     };
 
-    const handleDeleteMessage = (id, forEveryone) => {
-        if (forEveryone) {
+    const handleDeleteMessage = (id) => {
+        setDeleteOptions(id);
+    };
+
+    const handleDeleteConfirm = (type) => {
+        const id = deleteOptions;
+        if (!id) return;
+
+        if (type === 'everyone') {
             fetch(`${API_URL}/chats/${chat.id}/messages/${id}`, {
                 method: 'DELETE'
             })
                 .then(() => {
-                    setMessages(messages.filter(m => m.id !== id));
-                    showNotification("Message deleted");
+                    setMessages(messages.map(m => m.id === id ? { ...m, isDeleted: true, text: "This message was deleted", type: 'text', fileUrl: null, filename: null } : m));
+                    showNotification("Message deleted for everyone");
+                    setDeleteOptions(null);
                 })
                 .catch(err => console.error("Failed to delete message", err));
-        } else {
-            // For "Delete for me", we might just hide it locally, but for MVP we'll remove it
-            setMessages(messages.filter(m => m.id !== id));
+        } else if (type === 'me') {
+            fetch(`${API_URL}/chats/${chat.id}/messages/${id}/delete_for_me`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: currentUser?.id })
+            })
+                .then(() => {
+                    setMessages(messages.filter(m => m.id !== id));
+                    showNotification("Message deleted for you");
+                    setDeleteOptions(null);
+                })
+                .catch(err => console.error("Failed to delete for me", err));
         }
     };
 
@@ -675,7 +717,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                                         <p className="font-bold text-teal-700">
                                             {getSenderName(replyData.sender)}
                                         </p>
-                                        <p className="truncate text-gray-600">{replyData.text || replyData.filename}</p>
+                                        <p className="truncate text-gray-600">{replyData.text || replyData.filename || replyData.fileName}</p>
                                     </div>
                                 )}
 
@@ -693,7 +735,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                                         onClick={async (e) => {
                                             e.stopPropagation();
                                             if (!msg.fileUrl) {
-                                                alert("File URL missing");
+                                                showNotification("File URL missing");
                                                 return;
                                             }
 
@@ -710,7 +752,8 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                                             console.log("Final URL:", fileUrl);
 
                                             // Check file type
-                                            const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(msg.filename);
+                                            const currentFileName = msg.filename || msg.fileName || "";
+                                            const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(currentFileName);
 
                                             if (isImage) {
                                                 window.open(fileUrl, '_blank');
@@ -723,26 +766,26 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                                                     const url = window.URL.createObjectURL(blob);
                                                     const link = document.createElement('a');
                                                     link.href = url;
-                                                    link.download = msg.filename || 'download';
+                                                    link.download = msg.filename || msg.fileName || 'download';
                                                     document.body.appendChild(link);
                                                     link.click();
                                                     document.body.removeChild(link);
                                                     window.URL.revokeObjectURL(url);
                                                 } catch (error) {
                                                     console.error("Download error:", error);
-                                                    alert("Failed to download file.");
+                                                    showNotification("Failed to download file.");
                                                 }
                                             }
                                         }}
                                     >
-                                        <div className={`p-2 rounded-lg ${/\.(jpg|jpeg|png|gif|webp)$/i.test(msg.filename) ? 'bg-purple-100 text-purple-500' : 'bg-red-100 text-red-500'}`}>
-                                            {/\.(jpg|jpeg|png|gif|webp)$/i.test(msg.filename) ? <Image size={24} /> : <Paperclip size={24} />}
+                                        <div className={`p-2 rounded-lg ${/\.(jpg|jpeg|png|gif|webp)$/i.test(msg.filename || msg.fileName) ? 'bg-purple-100 text-purple-500' : 'bg-red-100 text-red-500'}`}>
+                                            {/\.(jpg|jpeg|png|gif|webp)$/i.test(msg.filename || msg.fileName) ? <Image size={24} /> : <Paperclip size={24} />}
                                         </div>
                                         <div className="flex-1 min-w-0">
-                                            <p className="font-medium text-gray-800 truncate text-sm">{msg.filename || "Unknown File"}</p>
-                                            <p className="text-xs text-gray-500">{msg.size || "Unknown size"}</p>
+                                            <p className="font-medium text-gray-800 truncate text-sm">{msg.filename || msg.fileName || "Unknown File"}</p>
+                                            <p className="text-xs text-gray-500">{msg.size || msg.fileSize || "Unknown size"}</p>
                                         </div>
-                                        <button className="opacity-0 group-hover/file:opacity-100 absolute -left-10 top-2 bg-yellow-100 text-yellow-700 p-1.5 rounded-full shadow-sm hover:bg-yellow-200 transition-opacity" title="Mark as Idea" onClick={(e) => { e.stopPropagation(); handleAnalyzeFile(msg.filename); }}>
+                                        <button className="opacity-0 group-hover/file:opacity-100 absolute -left-10 top-2 bg-yellow-100 text-yellow-700 p-1.5 rounded-full shadow-sm hover:bg-yellow-200 transition-opacity" title="Mark as Idea" onClick={(e) => { e.stopPropagation(); handleAnalyzeFile(msg.filename || msg.fileName); }}>
                                             <Lightbulb size={16} />
                                         </button>
                                     </div>
@@ -776,10 +819,15 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                                     </div>
                                 ) : (
                                     <div className="relative">
-                                        <p className="text-sm text-gray-800">{msg.text}</p>
-                                        <button className="opacity-0 group-hover/msg:opacity-100 absolute -left-10 top-0 bg-yellow-100 text-yellow-700 p-1.5 rounded-full shadow-sm hover:bg-yellow-200 transition-opacity" title="Mark as Idea" onClick={() => handleAnalyzeMessage(msg.text, msg.sender)}>
-                                            <Lightbulb size={16} />
-                                        </button>
+                                        <p className={`text-sm ${Boolean(msg.isDeleted) ? 'text-gray-500 italic flex items-center' : 'text-gray-800'}`}>
+                                            {Boolean(msg.isDeleted) && <span className="mr-2">🚫</span>}
+                                            {Boolean(msg.isDeleted) ? "This message was deleted" : msg.text}
+                                        </p>
+                                        {!Boolean(msg.isDeleted) && (
+                                            <button className="opacity-0 group-hover/msg:opacity-100 absolute -left-10 top-0 bg-yellow-100 text-yellow-700 p-1.5 rounded-full shadow-sm hover:bg-yellow-200 transition-opacity" title="Mark as Idea" onClick={() => handleAnalyzeMessage(msg.text, msg.sender)}>
+                                                <Lightbulb size={16} />
+                                            </button>
+                                        )}
                                     </div>
                                 )}
 
@@ -790,24 +838,26 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                                 </div>
 
                                 {/* Message Actions (Reply/Delete/Forward/Pin) - Visible on Hover */}
-                                <div className={`absolute ${isMe ? '-left-36' : '-right-36'} top-0 opacity-0 group-hover/msg:opacity-100 flex space-x-1 bg-white shadow-sm rounded-lg p-1 transition-opacity z-10`}>
-                                    <button onClick={() => setReplyingTo(msg)} className="p-1 hover:bg-gray-100 rounded text-gray-600" title="Reply">
-                                        <Reply size={14} />
-                                    </button>
-                                    <button onClick={() => { setMessageToForward(msg); setShowForwardModal(true); }} className="p-1 hover:bg-gray-100 rounded text-gray-600" title="Forward">
-                                        <Forward size={14} />
-                                    </button>
-                                    <button
-                                        onClick={() => handlePinMessage(msg.id)}
-                                        className={`p-1 hover:bg-gray-100 rounded ${msg.isPinned ? 'text-teal-600' : 'text-gray-600'}`}
-                                        title={msg.isPinned ? "Unpin" : "Pin"}
-                                    >
-                                        <Pin size={14} />
-                                    </button>
-                                    <button onClick={() => handleDeleteMessage(msg.id, true)} className="p-1 hover:bg-gray-100 rounded text-red-500" title="Delete">
-                                        <Trash2 size={14} />
-                                    </button>
-                                </div>
+                                {!msg.isDeleted && (
+                                    <div className={`absolute ${isMe ? '-left-36' : '-right-36'} top-0 opacity-0 group-hover/msg:opacity-100 flex space-x-1 bg-white shadow-sm rounded-lg p-1 transition-opacity z-10`}>
+                                        <button onClick={() => setReplyingTo(msg)} className="p-1 hover:bg-gray-100 rounded text-gray-600" title="Reply">
+                                            <Reply size={14} />
+                                        </button>
+                                        <button onClick={() => { setMessageToForward(msg); setShowForwardModal(true); }} className="p-1 hover:bg-gray-100 rounded text-gray-600" title="Forward">
+                                            <Forward size={14} />
+                                        </button>
+                                        <button
+                                            onClick={() => handlePinMessage(msg.id)}
+                                            className={`p-1 hover:bg-gray-100 rounded ${msg.isPinned ? 'text-teal-600' : 'text-gray-600'}`}
+                                            title={msg.isPinned ? "Unpin" : "Pin"}
+                                        >
+                                            <Pin size={14} />
+                                        </button>
+                                        <button onClick={() => handleDeleteMessage(msg.id, true)} className="p-1 hover:bg-gray-100 rounded text-red-500" title="Delete">
+                                            <Trash2 size={14} />
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     );
@@ -881,6 +931,8 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                 )}
             </div>
 
+
+
             {/* Forward Modal */}
             {
                 showForwardModal && (
@@ -903,40 +955,6 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                                         <span className="font-medium text-gray-800">{c.name}</span>
                                     </div>
                                 ))}
-                            </div>
-                        </div>
-                    </div>
-                )
-            }
-
-            {/* Add Member Modal */}
-            {
-                showAddMemberModal && (
-                    <div className="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                        <div className="bg-white rounded-xl w-full max-w-sm shadow-2xl flex flex-col p-6 animate-scale-in">
-                            <h3 className="text-lg font-bold text-gray-800 mb-4">Add Member</h3>
-                            <p className="text-sm text-gray-600 mb-4">Enter the email of the user you want to add to this group.</p>
-                            <input
-                                type="email"
-                                value={addMemberEmail}
-                                onChange={(e) => setAddMemberEmail(e.target.value)}
-                                placeholder="user@example.com"
-                                className="w-full border border-gray-300 rounded-lg px-4 py-2 mb-6 focus:outline-none focus:ring-2 focus:ring-teal-500"
-                                autoFocus
-                            />
-                            <div className="flex justify-end space-x-3">
-                                <button
-                                    onClick={() => setShowAddMemberModal(false)}
-                                    className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    onClick={submitAddMember}
-                                    className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition-colors font-medium"
-                                >
-                                    Add
-                                </button>
                             </div>
                         </div>
                     </div>
@@ -1009,6 +1027,42 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                     </div>
                 )
             }
+
+            {/* Delete Options Modal */}
+            {
+                deleteOptions && (
+                    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                        <div className="bg-white rounded-xl p-6 w-full max-w-sm shadow-2xl">
+                            <h3 className="text-lg font-bold mb-4 text-gray-800">Delete Message?</h3>
+                            <p className="text-gray-600 mb-6">Select how you want to delete this message.</p>
+
+                            <div className="space-y-3">
+                                <button
+                                    onClick={() => handleDeleteConfirm('me')}
+                                    className="w-full py-3 px-4 bg-teal-50 text-teal-700 font-medium rounded-lg hover:bg-teal-100 transition-colors flex items-center justify-center"
+                                >
+                                    Delete for me
+                                </button>
+                                {canDeleteForEveryone && (
+                                    <button
+                                        onClick={() => handleDeleteConfirm('everyone')}
+                                        className="w-full py-3 px-4 bg-red-50 text-red-600 font-medium rounded-lg hover:bg-red-100 transition-colors flex items-center justify-center"
+                                    >
+                                        Delete for everyone
+                                    </button>
+                                )}
+                                <button
+                                    onClick={() => setDeleteOptions(null)}
+                                    className="w-full py-2 text-gray-500 font-medium hover:text-gray-700 mt-2"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )
+            }
+
             {/* Confirmation Modal */}
             <ConfirmationModal
                 isOpen={confirmation.isOpen}

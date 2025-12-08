@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 
-const Register = ({ onRegister, onSwitchToLogin }) => {
+const Register = ({ onRegister, onSwitchToLogin, showNotification }) => {
     const [name, setName] = useState('');
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
@@ -30,10 +30,10 @@ const Register = ({ onRegister, onSwitchToLogin }) => {
                 onRegister(userData);
             } catch (error) {
                 console.error("Registration failed", error);
-                alert(`Registration failed: ${error.message}`);
+                showNotification(`Registration failed: ${error.message}`);
             }
         } else {
-            alert('Please fill in all fields');
+            showNotification('Please fill in all fields');
         }
     };
 

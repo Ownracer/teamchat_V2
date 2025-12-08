@@ -293,48 +293,7 @@ async def join_chat(request: dict):
 
 
 
-# --- Helper Functions ---
 
-def get_user(user_id: int):
-    # Query by integer ID field, not document ID (unless we migrate IDs to strings)
-    # For MVP, we'll search the collection. Ideally, use string IDs as doc IDs.
-    users_ref = db.collection("users")
-    query = users_ref.where("id", "==", user_id).limit(1).stream()
-    for doc in query:
-        return doc.to_dict()
-    return None
-
-def get_user_by_email(email: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return dict(row)
-    return None
-
-def create_user_doc(user_data):
-    # Use email as doc ID or auto-gen. Let's use auto-gen for now but store ID.
-    # To maintain integer IDs for frontend compatibility, we need to track max ID or just use timestamp/random int.
-    # For simplicity in this migration, let's just use the provided ID.
-    db.collection("users").add(user_data)
-
-def update_user_doc(user_id: int, update_data):
-    users_ref = db.collection("users")
-    query = users_ref.where("id", "==", user_id).limit(1).stream()
-    for doc in query:
-        doc.reference.update(update_data)
-        return
-
-def get_chat_doc(chat_id: int):
-    chats_ref = db.collection("chats")
-    query = chats_ref.where("id", "==", chat_id).limit(1).stream()
-    for doc in query:
-        data = doc.to_dict()
-        data['doc_id'] = doc.id # Store doc_id for subcollection access
-        return data
-    return None
 
 # --- Endpoints ---
 
@@ -574,41 +533,32 @@ async def join_chat(request: dict, background_tasks: BackgroundTasks):
             
     return {"message": "Joined chat", "chat": {"id": chat_id, "participants": participants}}
 
-@app.get("/chats/{chat_id}/messages")
-async def get_messages(chat_id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT * FROM messages WHERE chat_id = ? ORDER BY id", (chat_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    
-    msgs = []
-    for row in rows:
-        msg = dict(row)
-        # Convert boolean fields (SQLite stores as 0/1)
-        msg["isPinned"] = bool(msg["isPinned"])
-        # Ensure ID is int
-        msg["id"] = int(msg["id"])
-        
-        # Map DB columns to Pydantic model fields
-        if "fileName" in msg:
-            msg["filename"] = msg.pop("fileName")
-        if "fileSize" in msg:
-            msg["size"] = msg.pop("fileSize")
-            
-        msgs.append(msg)
-        
-    return msgs
+
 
 @app.get("/chats/{chat_id}/messages")
-async def get_messages(chat_id: int):
+async def get_messages(chat_id: int, user_id: int = None):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM messages WHERE chat_id = ? ORDER BY id ASC", (chat_id,))
     messages = []
+    
+    import json
+    
     for row in cursor.fetchall():
         msg = dict(row)
+        
+        # Check 'Delete for Me' logic
+        if user_id and msg.get("deleted_for"):
+            try:
+                deleted_for_list = json.loads(msg["deleted_for"])
+                # print(f"DEBUG: msg {msg['id']} deleted_for={deleted_for_list} user_id={user_id}")
+                if any(str(u) == str(user_id) for u in deleted_for_list):
+                    # print(f"DEBUG: Skipping msg {msg['id']}")
+                    continue # Skip this message
+            except Exception as e:
+                print(f"DEBUG: Error parsing deleted_for: {e}")
+                pass
+                
         # Parse replyTo JSON if it exists
         if msg.get("replyTo"):
             try:
@@ -652,6 +602,45 @@ async def add_message(chat_id: int, message: Message, background_tasks: Backgrou
         msg_dict.get("isVoice", False),
         json.dumps(msg_dict.get("replyTo")) if msg_dict.get("replyTo") else None
     ))
+    
+    # Self-Healing: Check if sender is in participants, if not add them
+    try:
+        sender_id = msg_dict.get("sender")
+        if sender_id and sender_id != 'me':
+             # Try to interpret sender_id as int if possible
+             try:
+                 sender_int = int(sender_id)
+             except:
+                 sender_int = sender_id
+                 
+             cursor.execute("SELECT participants, members FROM chats WHERE id = ?", (chat_id,))
+             chat_row = cursor.fetchone()
+             if chat_row:
+                 parts = json.loads(chat_row["participants"])
+                 if not any(str(p.get("id")) == str(sender_int) for p in parts):
+                     # Fetch user query
+                     cursor.execute("SELECT * FROM users WHERE id = ?", (sender_int,))
+                     user_row = cursor.fetchone()
+                     if user_row:
+                         user_data = dict(user_row)
+                         new_part = {
+                             "id": user_data["id"],
+                             "name": user_data["name"],
+                             "email": user_data["email"],
+                             "avatar": user_data["avatar"]
+                         }
+                         parts.append(new_part)
+                         cursor.execute("UPDATE chats SET participants = ?, members = ? WHERE id = ?", 
+                                      (json.dumps(parts), len(parts), chat_id))
+                                      
+                         # Broadcast updated participants list
+                         await manager.broadcast({
+                             "type": "participant_update",
+                             "participants": parts
+                         }, chat_id)
+    except Exception as e:
+        print(f"Self-healing participant error: {e}")
+        
     conn.commit()
     conn.close()
     
@@ -741,6 +730,42 @@ async def delete_chat(chat_id: int, background_tasks: BackgroundTasks):
     
     return {"message": "Chat deleted"}
 
+@app.post("/chats/{chat_id}/messages/{message_id}/delete_for_me")
+async def delete_message_for_me(chat_id: int, message_id: int, request: dict):
+    print(f"DEBUG: delete_message_for_me hit. chat_id={chat_id}, msg_id={message_id}, request={request}")
+    user_id = request.get("user_id")
+    if not user_id:
+        print("DEBUG: user_id missing")
+        raise HTTPException(status_code=400, detail="user_id required")
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 1. Fetch current deleted_for
+    cursor.execute("SELECT deleted_for FROM messages WHERE id = ?", (message_id,))
+    row = cursor.fetchone()
+    if not row:
+        print("DEBUG: Message not found")
+        conn.close()
+        raise HTTPException(status_code=404, detail="Message not found")
+        
+    current_deleted_for = row[0]
+    deleted_list = []
+    if current_deleted_for:
+        try:
+            deleted_list = json.loads(current_deleted_for)
+        except:
+            deleted_list = []
+            
+    # 2. Add user_id if not present
+    if user_id not in deleted_list:
+        deleted_list.append(user_id)
+        cursor.execute("UPDATE messages SET deleted_for = ? WHERE id = ?", (json.dumps(deleted_list), message_id))
+        conn.commit()
+        
+    conn.close()
+    return {"status": "success", "deleted_for": deleted_list}
+
 @app.post("/chats/{chat_id}/messages/{message_id}/pin")
 async def pin_message(chat_id: int, message_id: int):
     chats_ref = db.collection("chats")
@@ -795,6 +820,33 @@ async def update_message(chat_id: int, message_id: int, updates: dict, backgroun
     row = cursor.fetchone()
     updated_msg = dict(row)
     
+    if updated_msg.get("replyTo"):
+         try:
+             updated_msg["replyTo"] = json.loads(updated_msg["replyTo"])
+         except:
+             pass
+             
+    conn.close()
+    
+    # 3. Broadcast
+    await manager.broadcast(updated_msg, chat_id)
+    
+    # 4. Background Sync (Firestore)
+    def sync_update():
+        chats_ref = db.collection("chats")
+        query = chats_ref.where("id", "==", chat_id).limit(1).stream()
+        for doc in query:
+            messages_ref = doc.reference.collection("messages")
+            msg_query = messages_ref.where("id", "==", message_id).limit(1).stream()
+            for msg_doc in msg_query:
+                msg_doc.reference.update(updates)
+                
+    background_tasks.add_task(sync_update)
+    
+    return updated_msg
+
+
+    
     # Parse JSON fields if needed
     if updated_msg.get("replyTo") and isinstance(updated_msg["replyTo"], str):
         try:
@@ -823,18 +875,59 @@ async def update_message(chat_id: int, message_id: int, updates: dict, backgroun
 
 @app.delete("/chats/{chat_id}/messages/{message_id}")
 async def delete_message(chat_id: int, message_id: int):
-    chats_ref = db.collection("chats")
-    query = chats_ref.where("id", "==", chat_id).limit(1).stream()
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    for doc in query:
-        messages_ref = doc.reference.collection("messages")
-        msg_query = messages_ref.where("id", "==", message_id).limit(1).stream()
+    # 1. Soft Delete in SQLite
+    # We replace text, clear file/call info, and mark as deleted
+    updates = {
+        "text": "🚫 This message was deleted",
+        "type": "text",
+        "fileUrl": None,
+        "fileName": None, 
+        "fileSize": None,
+        "callStatus": None,
+        "callRoomName": None,
+        "isVoice": None,
+        "replyTo": None,
+        "isDeleted": True 
+    }
+    
+    cursor.execute("""
+        UPDATE messages 
+        SET text = ?, type = ?, fileUrl = NULL, fileName = NULL, 
+            fileSize = NULL, callStatus = NULL, callRoomName = NULL, 
+            isVoice = NULL, replyTo = NULL, isDeleted = 1
+        WHERE id = ?
+    """, (updates["text"], updates["type"], message_id))
+    
+    if cursor.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Message not found")
         
-        for msg_doc in msg_query:
-            msg_doc.reference.delete()
-            return {"message": "Message deleted"}
-            
-    raise HTTPException(status_code=404, detail="Message not found")
+    conn.commit()
+    
+    # Fetch updated message for broadcast
+    cursor.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
+    updated_msg = dict(cursor.fetchone())
+    conn.close()
+    
+    # 2. Broadcast Update
+    await manager.broadcast(updated_msg, chat_id)
+    
+    # 3. Background Sync (Firestore)
+    def sync_soft_delete():
+        chats_ref = db.collection("chats")
+        query = chats_ref.where("id", "==", chat_id).limit(1).stream()
+        for doc in query:
+            messages_ref = doc.reference.collection("messages")
+            msg_query = messages_ref.where("id", "==", message_id).limit(1).stream()
+            for msg_doc in msg_query:
+                msg_doc.reference.update(updates)
+
+    sync_soft_delete()
+    
+    return {"status": "success", "message": "Message deleted"}
 
 
 

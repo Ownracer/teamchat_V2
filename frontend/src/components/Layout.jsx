@@ -3,12 +3,13 @@ import Sidebar from './Sidebar';
 import ChatWindow from './ChatWindow';
 import IdeaHub from './IdeaHub';
 import CalendarView from './CalendarView';
-import BottomNav from './BottomNav';
+
 import Login from './Login';
 import Register from './Register';
 import Profile from './Profile';
 import ConfirmationModal from './ConfirmationModal';
-import { Edit2 } from 'lucide-react';
+import Toast from './Toast';
+import { Edit2, Menu } from 'lucide-react';
 
 const Layout = () => {
   const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -16,6 +17,7 @@ const Layout = () => {
   const [isRegistering, setIsRegistering] = useState(false);
   const [selectedChat, setSelectedChat] = useState(null);
   const [activeTab, setActiveTab] = useState('chats'); // chats, ideas, calendar, profile
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false); // Controls sidebar visibility on mobile for non-chat tabs
 
   // Confirmation Modal State
   const [confirmation, setConfirmation] = useState({
@@ -25,6 +27,13 @@ const Layout = () => {
     onConfirm: () => { },
     isDanger: false
   });
+
+  const [toast, setToast] = useState(null);
+
+  const showNotification = (message) => {
+    setToast(message);
+    setTimeout(() => setToast(null), 3000);
+  };
 
   // Lifted Chats State
   const [chats, setChats] = useState([]);
@@ -85,9 +94,9 @@ const Layout = () => {
   // Auth Flow
   if (!user) {
     if (isRegistering) {
-      return <Register onRegister={(userData) => setUser(userData)} onSwitchToLogin={() => setIsRegistering(false)} />;
+      return <Register onRegister={(userData) => setUser(userData)} onSwitchToLogin={() => setIsRegistering(false)} showNotification={showNotification} />;
     }
-    return <Login onLogin={(userData) => setUser(userData)} onSwitchToRegister={() => setIsRegistering(true)} />;
+    return <Login onLogin={(userData) => setUser(userData)} onSwitchToRegister={() => setIsRegistering(true)} showNotification={showNotification} />;
   }
 
   const handleSelectChat = (chat) => {
@@ -117,7 +126,7 @@ const Layout = () => {
           })
           .catch(err => {
             console.error("Failed to delete chat", err);
-            alert("Failed to delete chat. Please try again.");
+            showNotification("Failed to delete chat. Please try again.");
           });
       }
     });
@@ -142,7 +151,7 @@ const Layout = () => {
           })
           .catch(err => {
             console.error("Failed to delete chats", err);
-            alert("Failed to delete some chats.");
+            showNotification("Failed to delete some chats.");
           });
       }
     });
@@ -168,7 +177,7 @@ const Layout = () => {
       })
       .catch(err => {
         console.error("Failed to create group", err);
-        alert("Failed to create group. Please try again.");
+        showNotification("Failed to create group. Please try again.");
       });
   };
 
@@ -205,7 +214,7 @@ const Layout = () => {
       })
       .catch(err => {
         console.error("Join group error", err);
-        alert("Failed to join group");
+        showNotification("Failed to join group");
       });
   };
 
@@ -260,10 +269,25 @@ const Layout = () => {
     }
   };
 
+  // Helper logic for mobile visibility
+  const isMobileDetailOpen = selectedChat || (activeTab !== 'chats' && !mobileMenuOpen);
+
+  const MobileHeader = ({ title }) => (
+    <div className="md:hidden flex items-center p-4 bg-white border-b sticky top-0 z-10">
+      <button
+        onClick={() => setMobileMenuOpen(true)}
+        className="mr-3 p-2 hover:bg-gray-100 rounded-full"
+      >
+        <Menu size={24} />
+      </button>
+      <h2 className="text-xl font-bold">{title}</h2>
+    </div>
+  );
+
   return (
     <div className="flex h-[100dvh] md:h-screen bg-gray-100 overflow-hidden">
-      {/* Sidebar (Hidden on mobile if chat is selected, visible otherwise) */}
-      <div className={`${selectedChat ? 'hidden md:flex' : 'flex'} w-full md:w-auto flex-col h-full`}>
+      {/* Sidebar (Hidden on mobile if detail view is open) */}
+      <div className={`${isMobileDetailOpen ? 'hidden md:flex' : 'flex'} w-full md:w-auto flex-col h-full`}>
         <Sidebar
           chats={chats}
           publicGroups={publicGroups}
@@ -271,19 +295,26 @@ const Layout = () => {
           onCreateGroup={handleCreateGroup}
           onJoinGroup={handleJoinGroup}
           activeTab={activeTab}
-          onTabChange={setActiveTab}
+          onTabChange={(tab) => {
+            setActiveTab(tab);
+            setMobileMenuOpen(false); // Close menu (show content) when tab changes
+          }}
           onLogout={() => setUser(null)}
           currentUser={user}
           onBulkDelete={handleBulkDelete}
+          showNotification={showNotification}
         />
-        <div className="md:hidden">
-          <BottomNav activeTab={activeTab} onTabChange={setActiveTab} />
-        </div>
+
       </div>
 
       {/* Main Content Area */}
-      <div className={`flex-1 h-full ${!selectedChat && activeTab === 'chats' ? 'hidden md:block' : 'block'}`}>
-        {renderMainContent()}
+      <div className={`flex-1 h-full ${!isMobileDetailOpen ? 'hidden md:block' : 'block'} flex flex-col`}>
+        {activeTab !== 'chats' && !selectedChat && (
+          <MobileHeader title={activeTab.charAt(0).toUpperCase() + activeTab.slice(1)} />
+        )}
+        <div className="flex-1 overflow-hidden relative">
+          {renderMainContent()}
+        </div>
       </div>
 
       {/* Confirmation Modal */}
@@ -296,6 +327,7 @@ const Layout = () => {
         isDanger={confirmation.isDanger}
         confirmText="Delete"
       />
+      <Toast message={toast} onClose={() => setToast(null)} />
     </div>
   );
 };
