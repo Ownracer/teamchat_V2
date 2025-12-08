@@ -77,6 +77,53 @@ A modern, feature-rich chat application built with React and FastAPI, featuring 
 2.  Register or Login (User creation is handled automatically on first login).
 3.  Start chatting, creating groups, or sharing files!
 
+## Project Structure 📂
+
+```
+├── backend/                  # FastAPI Backend
+│   ├── database.py           # SQLite Database connection and schema
+│   ├── main.py               # Main API application entry point
+│   ├── models.py             # Pydantic data models
+│   ├── websocket_manager.py  # WebSocket connection handling
+│   ├── ai_service.py         # AI analysis logic
+│   ├── file_extractor.py     # File text extraction utility
+│   ├── teamchat.db           # SQLite database file
+│   ├── uploads/              # Directory for uploaded files
+│   ├── requirements.txt      # Python dependencies
+│   └── ... (various migration and utility scripts)
+│
+├── frontend/                 # React Frontend (Vite)
+│   ├── public/               # Static assets
+│   ├── src/
+│   │   ├── components/       # React Components
+│   │   │   ├── Layout.jsx          # Main App Layout (Sidebar + Content)
+│   │   │   ├── Sidebar.jsx         # Navigation and Chat List
+│   │   │   ├── ChatWindow.jsx      # Messaging Interface
+│   │   │   ├── IdeaHub.jsx         # Idea Management Feature
+│   │   │   ├── CalendarView.jsx    # Calendar Feature
+│   │   │   ├── Profile.jsx         # User Profile Settings
+│   │   │   ├── Login.jsx           # Authentication - Login
+│   │   │   ├── Register.jsx        # Authentication - Register
+│   │   │   ├── Toast.jsx           # Notification Component
+│   │   │   ├── VideoCall.jsx       # Video Call Interface
+│   │   │   ├── BottomNav.jsx       # Mobile Bottom Navigation (Deprecated)
+│   │   │   ├── ConfirmationModal.jsx # Generic Confirmation Dialog
+│   │   │   └── FilePreviewModal.jsx  # File Upload Preview
+│   │   │   
+│   │   ├── App.jsx           # Root Component
+│   │   ├── main.jsx          # DOM Entry Point
+│   │   ├── index.css         # Global Styles (Tailwind imports)
+│   │   └── assets/           # Frontend specific assets
+│   │
+│   ├── index.html            # HTML Entry Point
+│   ├── package.json          # Node dependencies
+│   ├── tailwind.config.js    # Tailwind CSS Configuration
+│   ├── vite.config.js        # Vite Configuration
+│   └── ...
+│
+└── README.md                 # Project Documentation
+```
+
 ## License 📄
 
 This project is licensed under the MIT License.
