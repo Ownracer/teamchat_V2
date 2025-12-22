@@ -186,11 +186,30 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
             }
 
             // Handle Normal Messages
+            // Handle Normal Messages
+            const incomingMsg = msg;
             setMessages(prev => {
-                // Avoid duplicates
-                if (prev.some(m => m.id === msg.id)) return prev;
-                return [...prev, msg];
+                const existingIndex = prev.findIndex(m => m.id === incomingMsg.id);
+                if (existingIndex !== -1) {
+                    // Update existing message
+                    const newMessages = [...prev];
+                    newMessages[existingIndex] = incomingMsg;
+                    return newMessages;
+                }
+                // Add new message
+                return [...prev, incomingMsg];
             });
+
+            // Auto-close call if it ended
+            if (incomingMsg.callStatus === 'ended') {
+                setCallRoomName(currentRoom => {
+                    if (currentRoom === incomingMsg.callRoomName) {
+                        return null; // Close the call window
+                    }
+                    return currentRoom;
+                });
+                setIsVoiceCall(false);
+            }
         };
 
         socket.onclose = () => {
@@ -342,10 +361,20 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
                 })
                     .then(res => res.json())
                     .then(updatedMsg => {
-                        setMessages(messages.map(m => m.id === updatedMsg.id ? updatedMsg : m));
+                        console.log("Call Ended Successfully:", updatedMsg);
+                        setMessages(prev => prev.map(m => m.id === updatedMsg.id ? updatedMsg : m));
+
                         if (activeCallMessageId === msgId) setActiveCallMessageId(null);
+                        setCallRoomName(null);
+                        setIsVoiceCall(false);
+
+                        // Force refresh to be sure
+                        fetchMessages();
                     })
-                    .catch(err => console.error("Failed to end call", err));
+                    .catch(err => {
+                        console.error("Failed to end call", err);
+                        showNotification("Failed to End Call");
+                    });
             }
         });
     };
@@ -571,6 +600,7 @@ const ChatWindow = ({ chat, chats, userStatuses, currentUser, onBack, onDeleteCh
         <div className="flex flex-col h-full bg-[#e5ddd5] relative">
             {callRoomName && (
                 <VideoCall
+                    key={callRoomName} // Force re-mount on new call
                     roomName={callRoomName}
                     userName={currentUser?.name || "Guest"}
                     onClose={handleLeaveCall}

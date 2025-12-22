@@ -11,8 +11,9 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
 from dotenv import load_dotenv
-from database import init_db, get_db_connection
-import sqlite3
+from database import init_db, get_db_connection, get_db_cursor
+import psycopg2
+from redis_client import redis_client
 
 # Load environment variables
 load_dotenv()
@@ -34,10 +35,15 @@ app = FastAPI()
 # WebSocket Manager
 manager = ConnectionManager()
 
-# Initialize Local DB
+# Initialize DB & Redis
 @app.on_event("startup")
-def startup_db():
-    init_db()
+async def startup_event():
+    init_db() # Ensure tables exist
+    await redis_client.connect()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await redis_client.close()
 
 # Create uploads directory
 os.makedirs("uploads", exist_ok=True)
@@ -56,10 +62,10 @@ app.add_middleware(
 def sync_to_firebase():
     print("Starting sync to Firebase...")
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = get_db_cursor(conn)
     
     # Sync Messages
-    cursor.execute("SELECT * FROM messages WHERE synced = 0")
+    cursor.execute("SELECT * FROM messages WHERE synced = FALSE")
     unsynced_messages = cursor.fetchall()
     
     for msg in unsynced_messages:
@@ -89,8 +95,8 @@ def sync_to_firebase():
                     "timestamp": msg_data.get("time")
                 })
                 
-                # Mark as synced in SQLite
-                conn.execute("UPDATE messages SET synced = 1 WHERE id = ?", (msg['id'],))
+                # Mark as synced in Postgres
+                conn.cursor().execute("UPDATE messages SET synced = TRUE WHERE id = %s", (msg['id'],))
                 conn.commit()
                 print(f"Synced message {msg['id']}")
                 
@@ -104,8 +110,8 @@ def sync_to_firebase():
 
 def get_user(user_id: int):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    cursor = get_db_cursor(conn)
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -114,8 +120,8 @@ def get_user(user_id: int):
 
 def get_user_by_email(email: str):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
+    cursor = get_db_cursor(conn)
+    cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -127,23 +133,23 @@ def create_user_doc(user_data):
     pass
 
 def update_user_doc(user_id: int, update_data):
-    # This should update SQLite
+    # This should update Postgres
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor() # Standard cursor for updates is fine
     
     # Construct SET clause dynamically
-    set_clause = ", ".join([f"{k} = ?" for k in update_data.keys()])
+    set_clause = ", ".join([f"{k} = %s" for k in update_data.keys()])
     values = list(update_data.values())
     values.append(user_id)
     
-    cursor.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
+    cursor.execute(f"UPDATE users SET {set_clause} WHERE id = %s", values)
     conn.commit()
     conn.close()
 
 def get_chat_doc(chat_id: int):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM chats WHERE id = ?", (chat_id,))
+    cursor = get_db_cursor(conn)
+    cursor.execute("SELECT * FROM chats WHERE id = %s", (chat_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -161,15 +167,14 @@ def get_chat_doc(chat_id: int):
 
 
 
+# --- Endpoints ---
+
 @app.get("/chats")
 async def get_chats(user_id: int = None):
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = get_db_cursor(conn)
     
     if user_id:
-        # This is tricky because participants is a JSON string.
-        # For MVP, we fetch all and filter in Python, or use LIKE.
-        # Fetching all is safer for now as we don't expect millions of chats.
         cursor.execute("SELECT * FROM chats")
     else:
         cursor.execute("SELECT * FROM chats")
@@ -207,6 +212,8 @@ async def create_chat(chat_data: dict, background_tasks: BackgroundTasks):
     import traceback
     try:
         print(f"Received chat_data: {chat_data}")
+        # Use Postgres SERIAL or manual ID? We used timestamp manual ID in SQLite.
+        # Postgres supports BIGINT Primary Key, so manual ID is fine.
         new_id = int(datetime.now().timestamp() * 1000)
         
         new_chat = {
@@ -222,14 +229,14 @@ async def create_chat(chat_data: dict, background_tasks: BackgroundTasks):
             "createdBy": chat_data.get("createdBy", None)
         }
         
-        # 1. Save to SQLite
+        # 1. Save to Postgres
         conn = get_db_connection()
         cursor = conn.cursor()
         
         import json
         cursor.execute('''
             INSERT INTO chats (id, name, type, participants, avatar, lastMessage, timestamp, isPrivate, createdBy, synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
         ''', (
             new_id,
             new_chat["name"],
@@ -238,7 +245,7 @@ async def create_chat(chat_data: dict, background_tasks: BackgroundTasks):
             new_chat["avatar"],
             new_chat["lastMessage"],
             new_chat["timestamp"],
-            1 if new_chat["isPrivate"] else 0,
+            new_chat["isPrivate"], # Postgres handles bool natively
             json.dumps(new_chat["createdBy"]) if new_chat["createdBy"] else None
         ))
         conn.commit()
@@ -255,16 +262,6 @@ async def create_chat(chat_data: dict, background_tasks: BackgroundTasks):
             f.write(f"[{datetime.now()}] {error_msg}\n")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/chats/public")
-async def get_public_chats():
-    chats_ref = db.collection("chats")
-    all_chats = [doc.to_dict() for doc in chats_ref.stream()]
-    public_chats = [
-        c for c in all_chats 
-        if c.get("type") == "group" and not c.get("isPrivate", False)
-    ]
-    return public_chats
-
 @app.post("/chats/join")
 async def join_chat(request: dict):
     chat_id = request.get("chat_id")
@@ -276,26 +273,22 @@ async def join_chat(request: dict):
         raise HTTPException(status_code=404, detail="Chat not found")
     
     participants = chat_doc_data.get("participants", [])
+    # Parse if string
+    if isinstance(participants, str):
+        participants = json.loads(participants)
+
     if not any(p.get("id") == user["id"] for p in participants):
         participants.append(user)
         
-        chats_ref = db.collection("chats")
-        query = chats_ref.where("id", "==", chat_id).limit(1).stream()
-        for doc in query:
-            doc.reference.update({
-                "participants": participants,
-                "members": len(participants)
-            })
+        # Update Postgres. get_chat_doc handles fetch. update needs specific call
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE chats SET participants = %s, synced = FALSE WHERE id = %s", 
+                       (json.dumps(participants), chat_id))
+        conn.commit()
+        conn.close()
             
     return {"message": "Joined chat", "chat": chat_doc_data}
-
-
-
-
-
-
-
-# --- Endpoints ---
 
 @app.post("/login")
 async def login(user_data: dict, background_tasks: BackgroundTasks):
@@ -317,12 +310,12 @@ async def login(user_data: dict, background_tasks: BackgroundTasks):
         "lastSeen": None
     }
     
-    # 1. Save to SQLite
+    # 1. Save to Postgres
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO users (id, name, email, avatar, status, lastSeen, synced)
-        VALUES (?, ?, ?, ?, ?, ?, 0)
+        VALUES (%s, %s, %s, %s, %s, %s, FALSE)
     ''', (
         new_user["id"],
         new_user["name"],
@@ -360,7 +353,7 @@ async def update_user(user_id: int, user_data: dict):
 @app.get("/ideas")
 async def get_ideas():
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = get_db_cursor(conn)
     cursor.execute("SELECT * FROM ideas ORDER BY timestamp DESC")
     rows = cursor.fetchall()
     conn.close()
@@ -374,32 +367,20 @@ async def get_ideas():
 
 @app.post("/ideas")
 async def add_idea(idea: dict, background_tasks: BackgroundTasks):
-    # idea: {title, content, tags}
     new_id = int(datetime.now().timestamp() * 1000)
-    
-    # Map frontend fields (title/content) to DB fields (text/category?)
-    # Frontend sends: {text, category} based on IdeaHub.jsx?
-    # Let's check IdeaHub.jsx. 
-    # Actually, let's stick to what the DB has: text, category.
-    # If frontend sends title/content, we might need to map.
-    # But for now, let's assume frontend sends what we expect or we store it loosely.
-    # DB has: text, category.
-    # Old code used: title, content, tags.
-    # Migration script used: text, category.
-    # Let's assume we want text/category.
     
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO ideas (id, text, category, votes, timestamp, is_analyzed, synced)
-        VALUES (?, ?, ?, ?, ?, ?, 0)
+        VALUES (%s, %s, %s, %s, %s, %s, FALSE)
     ''', (
         new_id,
-        idea.get("text") or idea.get("title"), # Fallback
-        idea.get("category") or idea.get("content"), # Fallback/Misuse
+        idea.get("text") or idea.get("title"), 
+        idea.get("category") or idea.get("content"), 
         0,
         datetime.now().isoformat(),
-        0
+        False
     ))
     conn.commit()
     conn.close()
@@ -414,7 +395,7 @@ async def add_idea(idea: dict, background_tasks: BackgroundTasks):
 async def delete_idea(idea_id: int, background_tasks: BackgroundTasks):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM ideas WHERE id = ?", (idea_id,))
+    cursor.execute("DELETE FROM ideas WHERE id = %s", (idea_id,))
     if cursor.rowcount == 0:
         conn.close()
         raise HTTPException(status_code=404, detail="Idea not found")
@@ -424,14 +405,12 @@ async def delete_idea(idea_id: int, background_tasks: BackgroundTasks):
     background_tasks.add_task(sync_to_firebase)
     return {"message": "Idea deleted"}
 
-
-
 @app.get("/chats/public")
 async def get_public_chats():
     conn = get_db_connection()
-    cursor = conn.cursor()
-    # Filter for public groups (type='group' and isPrivate=0)
-    cursor.execute("SELECT * FROM chats WHERE type = 'group' AND isPrivate = 0")
+    cursor = get_db_cursor(conn)
+    # Filter for public groups (type='group' and isPrivate=FALSE)
+    cursor.execute("SELECT * FROM chats WHERE type = 'group' AND isPrivate = FALSE")
     rows = cursor.fetchall()
     conn.close()
     
@@ -439,7 +418,7 @@ async def get_public_chats():
     for row in rows:
         chat = dict(row)
         # Parse JSON fields
-        if chat.get("participants"):
+        if chat.get("participants") and isinstance(chat["participants"], str):
             try:
                 chat["participants"] = json.loads(chat["participants"])
             except:
@@ -494,17 +473,16 @@ async def join_chat(request: dict, background_tasks: BackgroundTasks):
         return {"message": "Joined new chat", "chat": new_chat}
     
     # Update existing chat
-    # 1. Read from SQLite
+    # 1. Read from Postgres
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT participants FROM chats WHERE id = ?", (chat_id,))
+    cursor = get_db_cursor(conn)
+    cursor.execute("SELECT participants FROM chats WHERE id = %s", (chat_id,))
     row = cursor.fetchone()
     
     if not row:
         # If not in SQLite but in Firestore (edge case), we might need to fetch from Firestore.
         # But for "Local First", we assume SQLite is master or synced.
         # If missing in SQLite, we should probably fetch from Firestore or error.
-        # Let's fallback to get_chat_doc logic if SQLite fails, OR just error if we assume full sync.
         # Given the hybrid nature, let's try to get from SQLite.
         pass 
     
@@ -519,11 +497,15 @@ async def join_chat(request: dict, background_tasks: BackgroundTasks):
     if not any(p.get("id") == user["id"] for p in participants):
         participants.append(user)
         
-        # Update SQLite
+        # Update Postgres
+        # Logic above reuses conn implicitly if not closed, but here we closed nothing.
+        # Actually line 512 closes conn.
+        # Let's keep it clean.
+        cursor = conn.cursor()
         cursor.execute('''
             UPDATE chats 
-            SET participants = ?, synced = 0 
-            WHERE id = ?
+            SET participants = %s, synced = FALSE 
+            WHERE id = %s
         ''', (json.dumps(participants), chat_id))
         conn.commit()
         
@@ -538,8 +520,8 @@ async def join_chat(request: dict, background_tasks: BackgroundTasks):
 @app.get("/chats/{chat_id}/messages")
 async def get_messages(chat_id: int, user_id: int = None):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM messages WHERE chat_id = ? ORDER BY id ASC", (chat_id,))
+    cursor = get_db_cursor(conn)
+    cursor.execute("SELECT * FROM messages WHERE chat_id = %s ORDER BY id ASC", (chat_id,))
     messages = []
     
     import json
@@ -571,11 +553,12 @@ async def get_messages(chat_id: int, user_id: int = None):
 
 @app.post("/chats/{chat_id}/messages")
 async def add_message(chat_id: int, message: Message, background_tasks: BackgroundTasks):
-    # 1. Save to SQLite (Local First)
+    # 1. Save to Postgres
     conn = get_db_connection()
     cursor = conn.cursor()
     
     # Generate ID using timestamp
+    # Postgres supports BIGINT, manual ID is ok.
     new_id = int(datetime.now().timestamp() * 1000)
     
     msg_dict = message.dict()
@@ -585,7 +568,7 @@ async def add_message(chat_id: int, message: Message, background_tasks: Backgrou
     
     cursor.execute('''
         INSERT INTO messages (id, chat_id, text, sender, time, type, fileUrl, fileName, fileSize, isPinned, callRoomName, callStatus, isVoice, replyTo, synced)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
     ''', (
         new_id,
         chat_id,
@@ -596,7 +579,7 @@ async def add_message(chat_id: int, message: Message, background_tasks: Backgrou
         msg_dict.get("fileUrl"),
         msg_dict.get("filename"),
         msg_dict.get("size"),
-        0, # isPinned
+        False, # isPinned
         msg_dict.get("callRoomName"),
         msg_dict.get("callStatus"),
         msg_dict.get("isVoice", False),
@@ -613,14 +596,16 @@ async def add_message(chat_id: int, message: Message, background_tasks: Backgrou
              except:
                  sender_int = sender_id
                  
-             cursor.execute("SELECT participants, members FROM chats WHERE id = ?", (chat_id,))
-             chat_row = cursor.fetchone()
+             # Re-get cursor as dict
+             dict_cursor = get_db_cursor(conn)
+             dict_cursor.execute("SELECT participants FROM chats WHERE id = %s", (chat_id,))
+             chat_row = dict_cursor.fetchone()
              if chat_row:
                  parts = json.loads(chat_row["participants"])
                  if not any(str(p.get("id")) == str(sender_int) for p in parts):
                      # Fetch user query
-                     cursor.execute("SELECT * FROM users WHERE id = ?", (sender_int,))
-                     user_row = cursor.fetchone()
+                     dict_cursor.execute("SELECT * FROM users WHERE id = %s", (sender_int,))
+                     user_row = dict_cursor.fetchone()
                      if user_row:
                          user_data = dict(user_row)
                          new_part = {
@@ -630,8 +615,8 @@ async def add_message(chat_id: int, message: Message, background_tasks: Backgrou
                              "avatar": user_data["avatar"]
                          }
                          parts.append(new_part)
-                         cursor.execute("UPDATE chats SET participants = ?, members = ? WHERE id = ?", 
-                                      (json.dumps(parts), len(parts), chat_id))
+                         cursor.execute("UPDATE chats SET participants = %s WHERE id = %s", 
+                                      (json.dumps(parts), chat_id))
                                       
                          # Broadcast updated participants list
                          await manager.broadcast({
@@ -647,7 +632,7 @@ async def add_message(chat_id: int, message: Message, background_tasks: Backgrou
     # 2. Trigger Background Sync
     background_tasks.add_task(sync_to_firebase)
     
-    # 3. Broadcast via WebSocket
+    # 3. Broadcast via WebSocket (Uses Redis Pub/Sub internally now)
     await manager.broadcast(msg_dict, chat_id)
     
     return msg_dict
@@ -676,16 +661,16 @@ def sync_clear_messages(chat_id: int):
 
 @app.delete("/chats/{chat_id}/messages")
 async def clear_chat_messages(chat_id: int, background_tasks: BackgroundTasks):
-    # 1. Delete from SQLite
+    # 1. Delete from Postgres
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+    cursor.execute("DELETE FROM messages WHERE chat_id = %s", (chat_id,))
     
     # Update last message in chat
     cursor.execute('''
         UPDATE chats 
-        SET lastMessage = 'Chat cleared', timestamp = ?, synced = 0 
-        WHERE id = ?
+        SET lastMessage = 'Chat cleared', timestamp = %s, synced = FALSE 
+        WHERE id = %s
     ''', (datetime.now().isoformat(), chat_id))
     
     conn.commit()
@@ -701,7 +686,7 @@ def sync_delete_chat(chat_id: int):
     chats_ref = db.collection("chats")
     query = chats_ref.where("id", "==", chat_id).limit(1).stream()
     for doc in query:
-        # Delete messages
+        # Delete messages first
         messages_ref = doc.reference.collection("messages")
         batch = db.batch()
         for msg in messages_ref.stream():
@@ -717,11 +702,11 @@ def sync_delete_chat(chat_id: int):
 
 @app.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: int, background_tasks: BackgroundTasks):
-    # 1. Delete from SQLite
+    # 1. Soft/Hard Delete from Postgres
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-    cursor.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+    cursor.execute("DELETE FROM messages WHERE chat_id = %s", (chat_id,))
+    cursor.execute("DELETE FROM chats WHERE id = %s", (chat_id,))
     conn.commit()
     conn.close()
     
@@ -742,7 +727,7 @@ async def delete_message_for_me(chat_id: int, message_id: int, request: dict):
     cursor = conn.cursor()
     
     # 1. Fetch current deleted_for
-    cursor.execute("SELECT deleted_for FROM messages WHERE id = ?", (message_id,))
+    cursor.execute("SELECT deleted_for FROM messages WHERE id = %s", (message_id,))
     row = cursor.fetchone()
     if not row:
         print("DEBUG: Message not found")
@@ -760,7 +745,7 @@ async def delete_message_for_me(chat_id: int, message_id: int, request: dict):
     # 2. Add user_id if not present
     if user_id not in deleted_list:
         deleted_list.append(user_id)
-        cursor.execute("UPDATE messages SET deleted_for = ? WHERE id = ?", (json.dumps(deleted_list), message_id))
+        cursor.execute("UPDATE messages SET deleted_for = %s WHERE id = %s", (json.dumps(deleted_list), message_id))
         conn.commit()
         
     conn.close()
@@ -768,6 +753,26 @@ async def delete_message_for_me(chat_id: int, message_id: int, request: dict):
 
 @app.post("/chats/{chat_id}/messages/{message_id}/pin")
 async def pin_message(chat_id: int, message_id: int):
+    # TODO: This endpoint used Firestore only? It should update Postgres too.
+    # The original implementation only updated Firestore!
+    # I should verify this.
+    # Original: chats_ref = db.collection...
+    # I should add Postgres update.
+    
+    conn = get_db_connection()
+    cursor = get_db_cursor(conn)
+    cursor.execute("SELECT isPinned FROM messages WHERE id = %s", (message_id,))
+    row = cursor.fetchone()
+    
+    new_status = False
+    if row:
+        new_status = not row["isPinned"]
+        cursor.execute("UPDATE messages SET isPinned = %s, synced = FALSE WHERE id = %s", (new_status, message_id))
+        conn.commit()
+    
+    conn.close()
+    
+    # Also update Firestore (Hybrid)
     chats_ref = db.collection("chats")
     query = chats_ref.where("id", "==", chat_id).limit(1).stream()
     
@@ -790,12 +795,12 @@ async def update_message(chat_id: int, message_id: int, updates: dict, backgroun
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Update SQLite
+    # 1. Update Postgres
     fields = []
     values = []
     for k, v in updates.items():
         if k in ['text', 'callStatus', 'isPinned', 'replyTo']: # Allowed fields
-            fields.append(f"{k} = ?")
+            fields.append(f"{k} = %s")
             if isinstance(v, (dict, list)):
                 values.append(json.dumps(v))
             else:
@@ -807,7 +812,7 @@ async def update_message(chat_id: int, message_id: int, updates: dict, backgroun
         
     values.append(message_id) # For WHERE clause
     
-    cursor.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", values)
+    cursor.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = %s", values)
     
     if cursor.rowcount == 0:
         conn.close()
@@ -816,7 +821,8 @@ async def update_message(chat_id: int, message_id: int, updates: dict, backgroun
     conn.commit()
     
     # 2. Fetch updated message
-    cursor.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
+    cursor = get_db_cursor(conn) # Switch to dict cursor
+    cursor.execute("SELECT * FROM messages WHERE id = %s", (message_id,))
     row = cursor.fetchone()
     updated_msg = dict(row)
     
@@ -845,41 +851,12 @@ async def update_message(chat_id: int, message_id: int, updates: dict, backgroun
     
     return updated_msg
 
-
-    
-    # Parse JSON fields if needed
-    if updated_msg.get("replyTo") and isinstance(updated_msg["replyTo"], str):
-        try:
-            updated_msg["replyTo"] = json.loads(updated_msg["replyTo"])
-        except:
-            pass
-            
-    conn.close()
-    
-    # 3. Broadcast
-    await manager.broadcast(updated_msg, chat_id)
-    
-    # 4. Background Sync (Firestore)
-    def sync_update():
-        chats_ref = db.collection("chats")
-        query = chats_ref.where("id", "==", chat_id).limit(1).stream()
-        for doc in query:
-            messages_ref = doc.reference.collection("messages")
-            msg_query = messages_ref.where("id", "==", message_id).limit(1).stream()
-            for msg_doc in msg_query:
-                msg_doc.reference.update(updates)
-                
-    background_tasks.add_task(sync_update)
-    
-    return updated_msg
-
 @app.delete("/chats/{chat_id}/messages/{message_id}")
 async def delete_message(chat_id: int, message_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Soft Delete in SQLite
-    # We replace text, clear file/call info, and mark as deleted
+    # 1. Soft Delete in Postgres
     updates = {
         "text": "🚫 This message was deleted",
         "type": "text",
@@ -895,10 +872,10 @@ async def delete_message(chat_id: int, message_id: int):
     
     cursor.execute("""
         UPDATE messages 
-        SET text = ?, type = ?, fileUrl = NULL, fileName = NULL, 
+        SET text = %s, type = %s, fileUrl = NULL, fileName = NULL, 
             fileSize = NULL, callStatus = NULL, callRoomName = NULL, 
-            isVoice = NULL, replyTo = NULL, isDeleted = 1
-        WHERE id = ?
+            isVoice = NULL, replyTo = NULL, isDeleted = TRUE
+        WHERE id = %s
     """, (updates["text"], updates["type"], message_id))
     
     if cursor.rowcount == 0:
@@ -908,7 +885,8 @@ async def delete_message(chat_id: int, message_id: int):
     conn.commit()
     
     # Fetch updated message for broadcast
-    cursor.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
+    cursor = get_db_cursor(conn)
+    cursor.execute("SELECT * FROM messages WHERE id = %s", (message_id,))
     updated_msg = dict(cursor.fetchone())
     conn.close()
     
@@ -929,8 +907,6 @@ async def delete_message(chat_id: int, message_id: int):
     
     return {"status": "success", "message": "Message deleted"}
 
-
-
 @app.post("/chats/{chat_id}/participants")
 async def add_participant(chat_id: int, user_data: dict, background_tasks: BackgroundTasks):
     email = user_data.get("email")
@@ -941,12 +917,12 @@ async def add_participant(chat_id: int, user_data: dict, background_tasks: Backg
     if not user_to_add:
         raise HTTPException(status_code=404, detail="User not found")
         
-    # 1. Update SQLite
+    # 1. Update Postgres
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = get_db_cursor(conn)
     
     # Get current participants from SQLite
-    cursor.execute("SELECT participants FROM chats WHERE id = ?", (chat_id,))
+    cursor.execute("SELECT participants FROM chats WHERE id = %s", (chat_id,))
     row = cursor.fetchone()
     
     if not row:
@@ -963,8 +939,8 @@ async def add_participant(chat_id: int, user_data: dict, background_tasks: Backg
          
     current_participants.append(user_to_add)
     
-    cursor.execute("UPDATE chats SET participants = ?, members = ?, synced = 0 WHERE id = ?", 
-                  (json.dumps(current_participants), len(current_participants), chat_id))
+    cursor.execute("UPDATE chats SET participants = %s, synced = FALSE WHERE id = %s", 
+                  (json.dumps(current_participants), chat_id))
     conn.commit()
     conn.close()
     
@@ -976,8 +952,8 @@ async def add_participant(chat_id: int, user_data: dict, background_tasks: Backg
 @app.get("/chats/{chat_id}/participants")
 async def get_participants(chat_id: int):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT participants FROM chats WHERE id = ?", (chat_id,))
+    cursor = get_db_cursor(conn)
+    cursor.execute("SELECT participants FROM chats WHERE id = %s", (chat_id,))
     row = cursor.fetchone()
     conn.close()
     
@@ -1072,7 +1048,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
             try:
                 message_data = json.loads(data)
                 
-                # 1. Save to SQLite
+                # 1. Save to Postgres
                 conn = get_db_connection()
                 cursor = conn.cursor()
                 
@@ -1088,7 +1064,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
                 
                 cursor.execute('''
                     INSERT INTO messages (id, chat_id, text, sender, time, type, fileUrl, fileName, fileSize, synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
                 ''', (
                     msg_id,
                     chat_id,
@@ -1103,14 +1079,14 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int, user_id: int):
                 
                 # Update Chat's Last Message
                 last_msg_preview = text if msg_type == 'text' else f"Sent a {msg_type}"
-                cursor.execute('UPDATE chats SET lastMessage = ?, timestamp = ? WHERE id = ?', 
+                cursor.execute('UPDATE chats SET lastMessage = %s, timestamp = %s WHERE id = %s', 
                                (last_msg_preview, datetime.now().isoformat(), chat_id))
                 
                 conn.commit()
                 conn.close()
                 
-                # 2. Broadcast to Room
-                await manager.broadcast(json.dumps(message_data), chat_id)
+                # 2. Broadcast to Room (via Redis)
+                await manager.broadcast(message_data, chat_id)
                 
             except json.JSONDecodeError:
                 print(f"Invalid JSON received: {data}")

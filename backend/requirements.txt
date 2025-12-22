@@ -12,3 +12,6 @@ python-pptx
 beautifulsoup4
 lxml
 requests
+psycopg2-binary
+asyncpg
+redis

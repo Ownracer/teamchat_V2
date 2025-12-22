@@ -13,7 +13,7 @@ const VideoCall = ({ roomName, userName, onClose, isVoiceOnly = false }) => {
   useEffect(() => {
     if (!hasJoined) return; // don’t init Jitsi until user clicks Join
 
-    const domain = 'meet.jit.si';
+    const domain = 'meet.guifi.net';
     const safeRoomName = roomName.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
 
     const options = {
@@ -101,7 +101,7 @@ const VideoCall = ({ roomName, userName, onClose, isVoiceOnly = false }) => {
 
     if (!window.JitsiMeetExternalAPI) {
       const script = document.createElement('script');
-      script.src = 'https://meet.jit.si/external_api.js';
+      script.src = 'https://meet.guifi.net/external_api.js';
       script.async = true;
       script.onload = initJitsi;
       document.body.appendChild(script);
